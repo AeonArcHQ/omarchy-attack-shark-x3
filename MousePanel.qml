@@ -44,10 +44,10 @@ Panel {
     panelFlick.contentY = Math.max(0, Math.min(maxY, panelFlick.contentY - dy))
   }
 
-  function transportText() {
-    if (x3.battery.transport === "cable") return "Connected by cable"
-    if (x3.battery.transport === "receiver") return "Connected by receiver"
-    return "No mouse transport connected"
+  function stageOptions() {
+    var options = []
+    for (var i = 0; i < root.p.stages; i++) options.push({ value: i, label: Model.dpiLabel(root.p.dpi[i]) })
+    return options
   }
 
   onOpenedChanged: if (opened) {
@@ -98,7 +98,7 @@ Panel {
     slotSize: Style.bar.iconSlot * (root.view.label !== "" && !button.vertical ? 2 : 1)
     active: root.view.active
     dimmed: root.view.dimmed
-    tooltipText: Model.tooltip(x3.battery, null, x3.profile)
+    tooltipText: Model.tooltip(x3.battery, null, x3.profile, x3.stageKnown)
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.togglePercentage()
       else root.toggle()
@@ -151,16 +151,7 @@ Panel {
             }
             Text {
               width: parent.width
-              text: root.transportText()
-              color: root.fg
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-              textFormat: Text.PlainText
-            }
-            Text {
-              width: parent.width
-              text: Model.statusLine(x3.battery, null, x3.profile)
+              text: Model.statusLine(x3.battery, null, x3.profile, x3.stageKnown)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -183,15 +174,60 @@ Panel {
           // ---------- DPI ----------
           Section {
             title: "DPI"
-            note: "The mouse's DPI button cycles through the enabled stages."
+            note: "The mouse's DPI button cycles through the active stages."
 
-            Repeater {
-              model: [0, 1, 2, 3, 4, 5, 6, 7]
-              delegate: DpiStageRow {
-                required property var modelData
-                stageIndex: modelData
-                width: parent ? parent.width : 0
+            Flow {
+              width: parent.width
+              spacing: Style.spacing.md
+              Repeater {
+                model: root.stageOptions()
+                delegate: Button {
+                  required property var modelData
+                  text: modelData.label
+                  selected: modelData.value === root.p.stage
+                  bordered: true
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  onClicked: x3.set("stage", modelData.value)
+                }
               }
+            }
+            ValueSlider {
+              label: "DPI of stage " + (root.p.stage + 1)
+              minimum: Model.DPI_MIN
+              maximum: Model.DPI_MAX
+              step: 50
+              value: root.p.dpi[root.p.stage]
+              onCommitted: function(v) { x3.setStageDpi(root.p.stage, v) }
+            }
+            Row {
+              spacing: Style.space(8)
+              Repeater {
+                model: Model.COLOR_PRESETS
+                delegate: Rectangle {
+                  required property var modelData
+                  readonly property var swatch: modelData
+                  readonly property bool selected: Model.colorHex(swatch) === Model.colorHex(root.p.colors[root.p.stage])
+                  width: Style.space(26)
+                  height: width
+                  radius: width / 2
+                  color: Model.colorHex(swatch)
+                  border.width: selected ? Style.space(3) : 1
+                  border.color: selected ? root.fg : root.dim
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: x3.setStageColor(root.p.stage, parent.swatch)
+                  }
+                }
+              }
+            }
+            ValueSlider {
+              label: "Active stages"
+              minimum: 1
+              maximum: Model.USER_STAGES
+              value: root.p.stages
+              onCommitted: function(v) { x3.set("stages", v) }
             }
           }
 
@@ -329,98 +365,6 @@ Panel {
           }
 
           Item { width: parent.width; height: Style.space(2) }
-        }
-      }
-    }
-  }
-
-  // One DPI stage: enable in the cycle, choose it as current, and set its DPI.
-  component DpiStageRow: Column {
-    id: stageRow
-    property int stageIndex: 0
-
-    spacing: Style.space(4)
-
-    Item {
-      width: parent.width
-      implicitHeight: Math.max(stageLabel.implicitHeight, currentButton.implicitHeight, enabledSwitch.implicitHeight)
-
-      Text {
-        id: stageLabel
-        anchors.left: parent.left
-        anchors.verticalCenter: parent.verticalCenter
-        text: "Stage " + (stageRow.stageIndex + 1)
-        color: root.fg
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        textFormat: Text.PlainText
-      }
-      Button {
-        id: currentButton
-        anchors.right: enabledLabel.left
-        anchors.rightMargin: Style.space(8)
-        anchors.verticalCenter: parent.verticalCenter
-        text: "Current"
-        bordered: true
-        selected: root.p.stage === stageRow.stageIndex
-        enabled: root.p.enabled[stageRow.stageIndex] === 1
-        opacity: enabled ? 1 : 0.45
-        foreground: root.fg
-        fontFamily: root.fontFamily
-        onClicked: x3.set("stage", stageRow.stageIndex)
-      }
-      Text {
-        id: enabledLabel
-        anchors.right: enabledSwitch.left
-        anchors.rightMargin: Style.space(4)
-        anchors.verticalCenter: parent.verticalCenter
-        text: "Enabled"
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        textFormat: Text.PlainText
-      }
-      ToggleSwitch {
-        id: enabledSwitch
-        anchors.right: parent.right
-        anchors.rightMargin: Style.space(6)
-        anchors.verticalCenter: parent.verticalCenter
-        checked: root.p.enabled[stageRow.stageIndex] === 1
-        foreground: root.fg
-        onToggled: x3.setStageEnabled(stageRow.stageIndex, root.p.enabled[stageRow.stageIndex] !== 1)
-      }
-    }
-
-    ValueSlider {
-      label: "DPI of stage " + (stageRow.stageIndex + 1)
-      minimum: Model.DPI_MIN
-      maximum: Model.DPI_MAX
-      step: 50
-      value: root.p.dpi[stageRow.stageIndex]
-      onCommitted: function(v) { x3.setStageDpi(stageRow.stageIndex, v) }
-    }
-
-    Row {
-      spacing: Style.space(8)
-
-      Repeater {
-        model: Model.COLOR_PRESETS
-        delegate: Rectangle {
-          required property var modelData
-          readonly property var swatch: modelData
-          readonly property bool selected: Model.colorHex(swatch) === Model.colorHex(root.p.colors[stageRow.stageIndex])
-          width: Style.space(26)
-          height: width
-          radius: width / 2
-          color: Model.colorHex(swatch)
-          border.width: selected ? Style.space(3) : 1
-          border.color: selected ? root.fg : root.dim
-
-          MouseArea {
-            anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
-            onClicked: x3.setStageColor(stageRow.stageIndex, parent.swatch)
-          }
         }
       }
     }

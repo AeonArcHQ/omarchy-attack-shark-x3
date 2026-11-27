@@ -5,25 +5,28 @@ bar and, in the panel, DPI, polling rate, sensor, timing and button
 settings. Everything goes through the 2.4G receiver (`1d57:fa60`) or the USB
 cable (`1d57:fa61`), without the Windows driver.
 
-- The bar shows a battery icon and the percentage. The icon takes the
-  warning color at 15% battery or less, shows the charging glyph while the
-  cable is connected, and dims when the mouse or its receiver does not
-  respond or the mouse reports itself asleep.
+- The bar shows the mouse glyph and the percentage. The glyph takes the
+  warning color at 15% battery or less and dims when the mouse or its
+  receiver does not respond or the mouse reports itself asleep.
 - The X3 reports battery in 10% steps. The tooltip gives the state (on
-  battery, charging or asleep), the transport (receiver or cable), the
-  current DPI stage and, with no answer, the last level read.
+  battery, charging or asleep), the transport (receiver or cable) and, with
+  no answer, the last level read. Once the current DPI stage is known (a
+  DPI event from the mouse, or an acknowledged apply of the DPI report), the
+  tooltip includes it; the saved profile remembers that.
 - `showPercentage` option (default `true`): turned off, only the icon stays
   in the bar. A right click on the bar entry flips it.
-- A click opens the panel: eight DPI stages (enabled in the cycle, current
-  stage, value and indicator color), polling (125 to 1000 Hz), lift-off,
-  motion sync, ripple, angle snapping, Sleep Time, Deep Sleep, debounce and the function of
-  the 5 physical buttons (clicks, DPI, scroll, media, volume and Ctrl
-  shortcuts). Restoring factory settings takes two clicks.
+- A click opens the panel: one DPI editor for the current stage, buttons for
+  the active stages, six indicator colors and an Active stages count (1-6),
+  polling (125 to 1000 Hz), lift-off, motion sync, ripple, angle snapping,
+  Sleep Time, Deep Sleep, debounce and the function of the 5 physical
+  buttons (clicks, DPI, scroll, media, volume and Ctrl shortcuts).
+  Restoring factory settings takes two clicks.
 - The mouse does not let its settings be read. The panel shows the last
   profile the mouse confirmed, saved in
   `~/.local/state/attack-shark-x3/profile.json`; before the first change, it
-  assumes factory defaults. Changes made on the mouse itself (DPI button)
-  arrive through the receiver and update the profile.
+  assumes factory defaults for editing but does not claim to know the
+  current stage. Changes made on the mouse itself (DPI button) arrive
+  through the receiver and update the profile.
 - The X3 has no configurable lighting. The DPI indicator color is part of
   each stage; report 0x05 keeps the factory light bytes when timing settings
   are sent.
@@ -112,9 +115,10 @@ tests/check.sh                        # unittest, qmltestrunner, plugin validate
 
 ### Checklist with the mouse (wake it before each change)
 
-1. The bar shows the battery on the receiver; on the cable, it shows the
-   charging glyph. Unplugging returns to the receiver percentage.
-2. Each enabled DPI stage changes the cursor speed; so does changing the
+1. The bar shows the battery percentage on the receiver; on the cable, the
+   tooltip and panel say charging. Unplugging returns to the receiver
+   percentage.
+2. Each active DPI stage changes the cursor speed; so does changing the
    value of the current stage. The mouse's DPI button moves the selection in
    the panel.
 3. 500 Hz and 1000 Hz change the measured polling rate.

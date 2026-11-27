@@ -27,7 +27,7 @@
         "key": "showPercentage",
         "type": "boolean",
         "label": "Show percentage",
-        "description": "Show the battery percentage next to the battery icon. Off leaves only the icon; the tooltip still has the level.",
+        "description": "Show the battery percentage next to the mouse glyph. Off leaves only the glyph; the tooltip still has the level.",
         "defaultValue": true
       }
     ]

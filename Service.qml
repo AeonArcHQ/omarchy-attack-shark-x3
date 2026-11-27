@@ -12,6 +12,9 @@ Item {
 
   property var battery: Model.emptyBattery()
   property var profile: Model.normalizeProfile(null)
+  // The saved profile records whether the mouse reported or acknowledged
+  // the current stage (Model.stageKnownAfterEvent/stageKnownAfterApply).
+  readonly property bool stageKnown: root.profile.stageKnown === true
   property bool busy: false
   property string lastError: ""
 
@@ -44,15 +47,6 @@ Item {
     root.set("colors", values)
   }
 
-  function setStageEnabled(index, enabled) {
-    var next = Model.withStageEnabled(root.profile, index, enabled)
-    if (next === null) {
-      root.lastError = "At least one DPI stage has to stay enabled."
-      return
-    }
-    root.send(next, Model.packetsFor("enabled", next))
-  }
-
   function setButton(slot, option) {
     var next = Model.withButton(root.profile, slot, option)
     if (next === null) {
@@ -82,6 +76,10 @@ Item {
     if (applyProcess.running || root._pending === null) return
     var job = root._pending
     root._pending = null
+    // The helper saves this copy only when the mouse acknowledges every
+    // report, so the stage is recorded as known only after a successful apply.
+    job = { profile: Model.withValue(job.profile, "stageKnown", Model.stageKnownAfterApply(job.profile.stageKnown, job.packets)),
+      packets: job.packets }
     root._inFlight = job
     root.busy = true
     applyProcess.command = [root.helperPath, "--profile-path", root.profilePath, "apply", JSON.stringify(job.profile)].concat(job.packets)
@@ -158,6 +156,13 @@ Item {
       root._inFlight = null
       root.busy = false
       root.lastError = Model.applyError(applyStdout.text)
+      // The acknowledged job may have made the stage known; carry that into
+      // the shown profile and into a job still waiting, which saves next.
+      if (root.lastError === "" && job !== null && job.profile.stageKnown === true) {
+        if (root.profile.stageKnown !== true) root.profile = Model.withValue(root.profile, "stageKnown", true)
+        if (root._pending !== null && root._pending.profile.stageKnown !== true)
+          root._pending = { profile: Model.withValue(root._pending.profile, "stageKnown", true), packets: root._pending.packets }
+      }
       // A refused change leaves the mouse on the saved profile; show that one.
       if (root.lastError !== "" && root._pending === null) profileFile.reload()
       // A mouse-made change (DPI button, rate shortcut) that arrived while the

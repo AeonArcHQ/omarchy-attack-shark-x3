@@ -2,18 +2,7 @@
 // per line; everything the bar shows is decided here so tests/tst_model.qml
 // covers it.
 
-var GLYPH_BATTERY_UNKNOWN = "󰂑"
-var GLYPH_BATTERY_CHARGING = "󰂄"
-var GLYPH_BATTERY_10 = "󰁺"
-var GLYPH_BATTERY_20 = "󰁻"
-var GLYPH_BATTERY_30 = "󰁼"
-var GLYPH_BATTERY_40 = "󰁽"
-var GLYPH_BATTERY_50 = "󰁾"
-var GLYPH_BATTERY_60 = "󰁿"
-var GLYPH_BATTERY_70 = "󰂀"
-var GLYPH_BATTERY_80 = "󰂁"
-var GLYPH_BATTERY_90 = "󰂂"
-var GLYPH_BATTERY_100 = "󰁹"
+var GLYPH_MOUSE = "󰍽"
 var LOW_LEVEL = 15
 
 var NOTICES = {
@@ -37,21 +26,6 @@ var TRANSPORT_LABELS = {
 
 function emptyBattery() {
   return { connection: "starting", state: "", level: -1, measuredAt: null, transport: "" }
-}
-
-function batteryGlyph(state, level) {
-  if (state === "charging") return GLYPH_BATTERY_CHARGING
-  if (!(level >= 0)) return GLYPH_BATTERY_UNKNOWN
-  if (level >= 100) return GLYPH_BATTERY_100
-  if (level >= 90) return GLYPH_BATTERY_90
-  if (level >= 80) return GLYPH_BATTERY_80
-  if (level >= 70) return GLYPH_BATTERY_70
-  if (level >= 60) return GLYPH_BATTERY_60
-  if (level >= 50) return GLYPH_BATTERY_50
-  if (level >= 40) return GLYPH_BATTERY_40
-  if (level >= 30) return GLYPH_BATTERY_30
-  if (level >= 20) return GLYPH_BATTERY_20
-  return GLYPH_BATTERY_10
 }
 
 // Folds one helper line into the widget state. The last known level survives
@@ -96,7 +70,7 @@ function barView(model, showPercentage, formatNumber) {
   var ready = m.connection === "ready"
   var format = formatNumber || String
   return {
-    glyph: batteryGlyph(m.state, m.level),
+    glyph: GLYPH_MOUSE,
     label: ready && showPercentage && m.level >= 0 ? format(m.level) + "%" : "",
     active: ready && m.state === "discharging" && m.level <= LOW_LEVEL,
     dimmed: !ready || m.state === "asleep"
@@ -110,20 +84,20 @@ function hhmm(ms) {
   return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2)
 }
 
-function tooltip(model, formatTime, profile) {
+function tooltip(model, formatTime, profile, stageKnown) {
   var m = model || emptyBattery()
   var title = "Attack Shark X3"
   if (m.connection === "ready" && m.level >= 0) title += " · " + m.level + "%"
-  return title + " · " + statusLine(m, formatTime, profile)
+  return title + " · " + statusLine(m, formatTime, profile, stageKnown)
 }
 
 // The tooltip without the title and the current level, for the panel line
 // under the big percentage.
-function statusLine(model, formatTime, profile) {
+function statusLine(model, formatTime, profile, stageKnown) {
   var m = model || emptyBattery()
   var dpiText = ""
-  if (profile && profile.dpi && Number(profile.dpi.length) === 8) {
-    var stage = clamp(profile.stage, 0, 7)
+  if (stageKnown === true && profile && profile.dpi && Number(profile.dpi.length) === 8) {
+    var stage = clamp(profile.stage, 0, USER_STAGES - 1)
     dpiText = "DPI " + profile.dpi[stage] + " (stage " + (stage + 1) + ")"
   }
   if (m.connection === "ready") {
@@ -147,18 +121,22 @@ function statusLine(model, formatTime, profile) {
 
 // ---------- Configuration (feature reports, docs/re/findings.md) ----------
 
+// The firmware report carries eight DPI slots; only the first six are user
+// stages.
+var USER_STAGES = 6
+
 var DPI_MIN = 50
 var DPI_MAX = 26000
 var POLLING_RATES = [125, 250, 500, 1000]
-var COLOR_PRESETS = [[255, 0, 0], [255, 64, 0], [255, 255, 0], [0, 255, 0],
-  [0, 255, 255], [0, 0, 255], [255, 0, 255], [255, 255, 255]]
+var COLOR_PRESETS = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
+  [0, 255, 255], [255, 0, 255]]
 
-// X3.exe's restore routine (sub_4155e0). The factory struct has zero in the
-// two disabled DPI slots; the profile keeps valid 800 DPI entries there so
-// enabling one never sends an out-of-range value.
+// X3.exe's restore routine (sub_4155e0). The firmware report still carries
+// eight DPI slots, but only the first six are user stages; slots 7-8 keep
+// these factory bytes and are never enabled.
 var FACTORY = {
   dpi: [800, 1600, 2400, 3200, 5000, 26000, 800, 800],
-  enabled: [1, 1, 1, 1, 1, 1, 0, 0],
+  stages: USER_STAGES,
   stage: 1,
   colors: [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0],
     [0, 255, 255], [255, 0, 255], [255, 64, 0], [255, 255, 255]],
@@ -205,23 +183,27 @@ function normalizeProfile(raw) {
     out.dpi = []
     for (var d = 0; d < 8; d++) out.dpi.push(normalizeDpi(p.dpi[d]))
   }
-  if (p.enabled && Number(p.enabled.length) === 8) {
-    out.enabled = []
-    for (var e = 0; e < 8; e++) out.enabled.push(clamp(p.enabled[e], 0, 1))
-  }
   if (p.colors && Number(p.colors.length) === 8) {
     out.colors = []
     for (var c = 0; c < 8; c++) out.colors.push(normalizeColor(p.colors[c], f.colors[c]))
   }
-  var anyEnabled = false
-  for (var i = 0; i < 8; i++) anyEnabled = anyEnabled || out.enabled[i] === 1
-  if (!anyEnabled) out.enabled[0] = 1
-  out.stage = clamp(p.stage !== undefined ? p.stage : f.stage, 0, 7)
-  if (out.enabled[out.stage] !== 1) {
-    for (var s = 0; s < 8; s++) {
-      if (out.enabled[s] === 1) { out.stage = s; break }
-    }
+  for (var hidden = USER_STAGES; hidden < 8; hidden++) {
+    out.dpi[hidden] = f.dpi[hidden]
+    out.colors[hidden] = f.colors[hidden].slice()
   }
+  if (p.stages !== undefined) {
+    out.stages = clamp(p.stages, 1, USER_STAGES)
+  } else if (p.enabled && Number(p.enabled.length) === 8) {
+    // The first saved shape carried one enabled bit per stage. Count only the
+    // leading enabled user stages; slots 7-8 were never user stages.
+    var leading = 0
+    while (leading < USER_STAGES && clamp(p.enabled[leading], 0, 1) === 1) leading++
+    out.stages = Math.max(1, leading)
+  }
+  out.stage = clamp(p.stage !== undefined ? p.stage : f.stage, 0, out.stages - 1)
+  // Whether the mouse really reported or acknowledged this stage. The mouse
+  // cannot be read back, so a profile without the field does not know it.
+  out.stageKnown = p.stageKnown === true
   out.polling = clamp(p.polling !== undefined ? p.polling : f.polling, 0, 3)
   out.lift = clamp(p.lift !== undefined ? p.lift : f.lift, 0, 1)
   out.ripple = clamp(p.ripple !== undefined ? p.ripple : f.ripple, 0, 1)
@@ -274,18 +256,18 @@ function report4(p) {
   b[0] = 0x04; b[1] = 0x38; b[2] = 0x01
   b[3] = p.lift
   b[4] = p.ripple
-  var mask = 0
-  for (var e = 0; e < 8; e++) if (p.enabled[e] === 1) mask += 1 << e
-  b[5] = mask
+  b[5] = (1 << clamp(p.stages, 1, USER_STAGES)) - 1
   b[6] = p.angle
   b[7] = p.motionSync
   for (var i = 0; i < 8; i++) {
-    var v = p.dpi[i] / 50 - 1
+    var dpi = i < USER_STAGES ? p.dpi[i] : FACTORY.dpi[i]
+    var color = i < USER_STAGES ? p.colors[i] : FACTORY.colors[i]
+    var v = dpi / 50 - 1
     b[8 + i] = v & 0xff
     b[16 + i] = (v >> 8) & 0xff
-    b[25 + 3 * i] = p.colors[i][0]
-    b[26 + 3 * i] = p.colors[i][1]
-    b[27 + 3 * i] = p.colors[i][2]
+    b[25 + 3 * i] = color[0]
+    b[26 + 3 * i] = color[1]
+    b[27 + 3 * i] = color[2]
   }
   b[24] = p.stage + 1
   b[49] = 0x01
@@ -323,7 +305,7 @@ var REPORT_RESET = "0c0a01fe01fe00000000"
 var REPORT_ORDER = ["0c", "04", "05", "06", "08"]
 var REPORTS = {
   "0c": { fields: [], build: function(profile) { return REPORT_RESET } },
-  "04": { fields: ["dpi", "enabled", "stage", "colors", "lift", "ripple", "angle", "motionSync"],
+  "04": { fields: ["dpi", "stages", "stage", "colors", "lift", "ripple", "angle", "motionSync"],
     build: function(profile) { return report4(profile) } },
   "05": { fields: ["sleepTime", "deepSleep", "debounce"], build: function(profile) { return report5(profile) } },
   "06": { fields: ["polling"], build: function(profile) { return report6(profile) } },
@@ -355,29 +337,37 @@ function withValue(profile, field, value) {
   return normalizeProfile(next)
 }
 
-// A copy with one stage enabled or disabled, or null when disabling it
-// would leave the DPI cycle empty.
-function withStageEnabled(profile, index, enabled) {
-  var slot = clamp(index, 0, 7)
-  if (!enabled && profile.enabled[slot] === 1) {
-    var count = 0
-    for (var i = 0; i < 8; i++) if (profile.enabled[i] === 1) count++
-    if (count === 1) return null
-  }
-  var values = profile.enabled.slice()
-  values[slot] = enabled ? 1 : 0
-  return withValue(profile, "enabled", values)
-}
-
 // The mouse's own DPI button and rate shortcut move these without the host;
-// the receiver reports them so the saved profile can follow.
+// the receiver reports them so the saved profile can follow. A DPI event
+// also makes the current stage known.
 function applyEvent(profile, line) {
   var message = null
   try { message = JSON.parse(String(line || "")) } catch (error) { return null }
   if (!message || message.ok !== true) return null
-  if (message.event === "dpi") return withValue(profile, "stage", Number(message.stage) - 1)
+  if (message.event === "dpi") {
+    var moved = withValue(profile, "stage", Number(message.stage) - 1)
+    return withValue(moved, "stageKnown", stageKnownAfterEvent(profile.stageKnown, message))
+  }
   if (message.event === "polling") return withValue(profile, "polling", Number(message.index))
   return null
+}
+
+// Only the receiver's DPI event (`03 00 10 <stage> 00`) reports the stage.
+function stageKnownAfterEvent(known, message) {
+  return known === true || (!!message && message.ok === true && message.event === "dpi")
+}
+
+// After a successful apply: report 0x04 carries the stage byte, so the mouse
+// is on the sent stage; the other reports leave the stage as unknown as it was.
+function stageKnownAfterApply(known, packets) {
+  if (known === true) return true
+  var list = packets || []
+  for (var i = 0; i < list.length; i++) if (String(list[i]).substr(0, 2) === "04") return true
+  return false
+}
+
+function dpiLabel(dpi) {
+  return dpi >= 1000 && dpi % 1000 === 0 ? (dpi / 1000) + "k" : String(dpi)
 }
 
 // What the panel says when `x3-hid apply` fails.

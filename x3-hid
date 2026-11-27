@@ -12,7 +12,7 @@ b4, in steps of ten percent. See docs/re/findings.md for the evidence.
                     {"ok": true, "event": "power", "device": ...,
                      "transport": "receiver", "state": "discharging",
                      "level": 40}
-                    {"ok": true, "event": "dpi", "stage": 3}       (1-8)
+                    {"ok": true, "event": "dpi", "stage": 3}       (1-6, one-based)
                     {"ok": true, "event": "polling", "index": 3}   (0-3)
                     {"ok": false, "error": <code>}
                     On the cable the state is "charging"; the level is
