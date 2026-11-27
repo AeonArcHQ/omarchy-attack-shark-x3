@@ -132,7 +132,10 @@ Panel {
 
         Column {
           id: column
-          width: panelFlick.width
+          // At a fractional scale the panel can start between device pixels, and the
+          // Flickable clip then eats the 1 px left border of the first button in a row.
+          x: 1
+          width: panelFlick.width - 2
           spacing: Style.space(12)
 
           // ---------- Battery ----------
