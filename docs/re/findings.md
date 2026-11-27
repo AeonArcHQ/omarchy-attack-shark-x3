@@ -108,7 +108,7 @@ M900 comparison: `0x10` (DPI), `0x20` (polling), `0x40` (power) and `0x50` (ACK)
   | Dirty flag | Report |
   |---|---|
   | `0xf1` | 0x04 (DPI and sensor) |
-  | `0xfb` | 0x05 (light, sleep, debounce) |
+  | `0xfb` | 0x05 (light, sleep timers, debounce) |
   | `0xf6` | 0x06 (polling) |
   | `0x100` | 0x08 (buttons) |
   | `0x109 + n` | 0x09 (macro of button n, for buttons whose function is `0x11`) |
@@ -146,16 +146,16 @@ M900 comparison: `0x10` (DPI), `0x20` (polling), `0x40` (power) and `0x50` (ACK)
 - **Differences from the M900** (observed): no nibble packing. Each setting has its own byte: lift 3, ripple 4, angle 6, motion 7. The M900 packed `lift << 4 | ripple` in byte 3, `angle << 4 | motion` in byte 4, and had the sensor mode in byte 6. The X3 has no sensor-mode field. Byte 49 is `01` (M900: `03`).
 - **Inferred**: the firmware accepts this layout, since the app is the vendor's own for this mouse. **Unknown** until a live send: whether the firmware ignores byte 49.
 
-### Report 0x05: light, sleep, debounce (`sub_413ca0`), 15 bytes
+### Report 0x05: light, sleep timers, debounce (`sub_413ca0`), 15 bytes
 
 | Index | Content | Profile field |
 |---|---|---|
 | 0–2 | `05 0f 01` | |
 | 3 | `light_mode << 4` | `+0x94c` |
-| 4 | `(sleep & 0xF0) \| (9 − speed)` | `+0x92c`, `+0x928` |
-| 5 | `((sleep << 4) & 0xFF) \| brightness` when the mode is 1 or 9; otherwise `((sleep << 4) & 0xFF) \| 8` | `+0x92c`, `+0x924` |
+| 4 | `(deep_sleep & 0xF0) \| (9 − speed)` | `+0x92c`, `+0x928` |
+| 5 | `((deep_sleep << 4) & 0xFF) \| brightness` when the mode is 1 or 9; otherwise `((deep_sleep << 4) & 0xFF) \| 8` | `+0x92c`, `+0x924` |
 | 6–8 | light color R, G, B | bytes `+0x95c..+0x95e` |
-| 9 | light off after | `+0x930` |
+| 9 | Sleep Time, in 0.5 min steps | `+0x930` |
 | 10 | debounce | `+0x958` |
 | 11–12 | BE checksum of bytes 3..10 | |
 | 13–14 | `00` | |
@@ -165,7 +165,7 @@ M900 comparison: `0x10` (DPI), `0x20` (polling), `0x40` (power) and `0x50` (ACK)
 - **Observed**: the debounce label shows `value × 2` with a "ms" format (`lea eax, [edi+edi]` before `Format`). So the byte sent is half the displayed time: the slider covers 4–50 ms in 2 ms steps. **Unknown** whether the firmware uses the byte as ms or as 2 ms units; the app's label implies 2 ms units.
 - **Observed**: the light controls are hidden in `ms_1_page.xml`, but the combo lists the same 12 modes as the M900 (`lan.xml`): 0 LED Off, 1 Static, 2 Breathing, 3 Neon, 4 Color Breathing, 5 Color Static, 6 Mixed Breathing, 7 Rainbow Wave, 8 Lightning, 9 Static Mixed Color, 10 Marquee, 11 Marquee 2. **Inferred**: the X3 has no user-visible RGB, so report 0x05 matters mainly for sleep and debounce.
 - A separate combo `ms_1_combo_light_ble` reads `+0x950` (`ev_6450b7fb…`). Where `+0x950` is sent is **unknown**.
-- **Unknown**: the units of light-off and sleep (minutes on the M900; the labels are formatted by `sub_40fe00` and `sub_40fc80`, not read).
+- **Observed** (live, 2026-11-27): the value split across bytes 4–5 is Deep Sleep in minutes (1–60, factory 10); byte 9 is Sleep Time in 0.5-minute steps (1–60 → 0.5–30 min, factory 1 = 30 s). X3.exe's "Move Wake" and the BLE light combo are never sent.
 - `ms_1_check_movemode` (Move Wake) exists in the page but is hidden, and the UI refresh does not touch it. Its profile field and report are **unknown**.
 
 ### Report 0x06: polling rate, 9 bytes
@@ -247,8 +247,8 @@ M900 comparison: `0x10` (DPI), `0x20` (polling), `0x40` (power) and `0x50` (ACK)
 | Speed | `+0x928` | 6 | |
 | Light color | `+0x95c` | `0xff0000` | blue (`00 00 ff`) |
 | Palette | `+0x980..+0x99c` | `ff, ff00, ff0000, ff00ff, ffff, ffffff, ffffff, 80ff` | |
-| Sleep | `+0x92c` | 10 | |
-| Light off after | `+0x930` | 1 | |
+| Deep Sleep | `+0x92c` | 10 | minutes |
+| Sleep Time | `+0x930` | 1 | 0.5-minute steps; 30 s |
 | Debounce | `+0x958` | 4 | shown as 8 ms |
 | Others | `+0x8b0`, `+0x8b8`, `+0x2280` | 0 | unknown |
 | Others | `+0x89c` = 3, `+0x898` = 420, `+0x8a4` = 6 | | unknown |
@@ -300,14 +300,27 @@ Others: `07`=7, `0A`=7, `0B`=7, `10`=7, `A0`=7, `22`=131, `23`=131/130, `24`=7, 
 
 ## Open questions
 
-1. Does the firmware send DPI (`0x10`) and polling (`0x20`) events with model byte `0x00` or `0x10`? With `0x10`, the app would ignore them. A live check: press the DPI button while listening on the receiver hidraw.
+1. **Observed** (live, 2026-11-27): DPI events use model byte `0x00` (`03 00 10 <stage> 00`) after the host primes the receiver with a feature report. Whether polling (`0x20`) events also use `0x00` remains untested.
 2. Does the wired interface (fa61) send power events or ACKs? The wired sender does not wait for an ACK.
 3. Does the firmware accept the X3 report 0x04 layout, and what does byte 49 mean?
 4. Debounce units: ms or 2 ms steps?
-5. Units of sleep and light-off (minutes on the M900).
+5. **Observed** (live, 2026-11-27): Deep Sleep is in minutes and Sleep Time is in 0.5-minute steps; see report 0x05.
 6. Move Wake (`check_movemode`): profile field and report.
 7. Where `+0x950` (BLE light mode) and the unknown fields `+0x898`, `+0x89c`, `+0x8a4` go.
 8. The 2.4G chunk format for report 0x09 (header `0x4009`).
 9. The meaning of report 0x0C and of function ID `0x34` (`3c 00 00`).
 10. Whether the 0x04 → 0x0a battery jump at plug-in is a re-estimate or a "charging" placeholder: compare the level right after unplugging.
 11. Resolved: see "Report lengths on the X3 firmware".
+
+## Live tests on 2026-11-27
+
+Receiver `fa60`, cable unplugged, unless noted.
+
+- **Observed**: battery reports were first 40 % and then 70 %; the 70 % input frame was `03 10 40 01 07`.
+- **Observed**: before the host sent any feature report, pressing the DPI button produced no DPI event; the mouse reported only battery (`03 10 40 …`).
+- **Observed**: after one `HIDIOCSFEATURE` of report 0x06 (`06 09 01 01 fe 00 00 00 00`, 1000 Hz, unchanged), every DPI press produced `03 00 10 <stage> 00` (model byte `0x00`). The stage cycle was 3→4→5→6→1→2, and the bottom LED beside the DPI button flashed blue, yellow, cyan, magenta, red and green respectively.
+- **Observed**: report 0x05 was acknowledged as `03 10 50 00 05` — model `0x10`, event `0x50`, status `0` in b3 and the acknowledged report ID in b4.
+- **Observed**: a send made while the mouse dozes gets no ACK and is not applied; the next try after it wakes is ACKed. X3.exe retries about every 2 s, up to 10 tries.
+- **Observed**: report 0x06 sent once to a dozing mouse got no ACK.
+- **Observed**: the light test — report 0x05 with mode 1 (Static), brightness 8 and color `ff 00 ff` — was ACKed but lit neither LED. The X3 has no configurable light.
+- **Observed**: the top LED is a charging indicator: purple while the cable is plugged in and off on the receiver.

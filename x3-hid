@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""Battery reader and feature-report transport for the ATTACK SHARK X3.
+
+The receiver (`1d57:fa60`) and the mouse's cable interface (`1d57:fa61`)
+expose the same vendor interface on USB interface 2. Input report 3 is
+`03 <model> <event> <b3> <b4>`; the X3 model byte is 0x10. Event 0x40 (and
+the battery-only event 0x60) carries the sleep state in b3 and the level in
+b4, in steps of ten percent. See docs/re/findings.md for the evidence.
+
+  x3-hid [--profile-path PATH] watch
+                    one JSON object per line, whenever something changes:
+                    {"ok": true, "event": "power", "device": ...,
+                     "transport": "receiver", "state": "discharging",
+                     "level": 40}
+                    {"ok": true, "event": "dpi", "stage": 3}       (1-8)
+                    {"ok": true, "event": "polling", "index": 3}   (0-3)
+                    {"ok": false, "error": <code>}
+                    On the cable the state is "charging"; the level is
+                    omitted until a battery report has been measured.
+  x3-hid [--profile-path PATH] apply <profile-json> <hex>...
+                    sends each feature report and then saves the profile:
+                    {"ok": true} or {"ok": false, "error": <code>}
+  x3-hid [--profile-path PATH] save <profile-json>
+                    saves the profile without sending anything, for changes
+                    the mouse made itself (DPI button, rate shortcut)
+
+The mouse cannot be read back (X3.exe never asks for a feature report), so
+the saved profile is the only record of what was last applied. Model.js
+builds the reports for `apply`; `watch` sends the saved polling report once
+when the receiver opens because DPI events only start after that report.
+
+Error codes: missing (no receiver or cable vendor interface), access-denied
+(no permission on the hidraw node), asleep (receiver present, mouse silent
+for SILENCE_SECONDS), timeout (no ACK over the receiver after the retries,
+for every report; only the priming send of `watch` ignores a missing ACK),
+rejected (ACK with a non-zero status), invalid
+(bad arguments).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import re
+import select
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+RECEIVER_HID_ID = "0003:00001D57:0000FA60"
+CABLE_HID_ID = "0003:00001D57:0000FA61"
+REPORT_ID = 0x03
+MODEL_X3 = 0x10
+EVENT_DPI = 0x10
+EVENT_POLLING = 0x20
+EVENT_POWER = 0x40
+EVENT_BATTERY = 0x60
+EVENT_ACK = 0x50
+ACK_SECONDS = 2.0
+ACK_ATTEMPTS = 10
+CABLE_SETTLE_SECONDS = 0.5
+# Lengths accepted by the X3 firmware, including the report ID. The packets
+# passed on the command line keep X3.exe's full length byte and zero padding.
+SEND_LENGTHS = {0x04: 52, 0x05: 13, 0x06: 9, 0x08: 59, 0x0C: 6}
+BUILT_LENGTHS = {0x04: 56, 0x05: 15, 0x06: 9, 0x08: 59, 0x0C: 10}
+# Default for manual runs only; Service.qml always passes --profile-path.
+PROFILE_PATH = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "attack-shark-x3" / "profile.json"
+# X3.exe marks the mouse disconnected after 6 s without a report.
+SILENCE_SECONDS = 6.0
+RETRY_SECONDS = 3.0
+
+
+def usb_interface_number(device: Path) -> Optional[int]:
+    """USB interface number from the sysfs target of a hidraw device link."""
+    matches = re.findall(r":\d+\.(\d+)(?:/|$)", os.path.realpath(str(device)))
+    # PCI device names (`00:14.0`) match the same shape; the USB interface
+    # (`3-2:1.2`) is the last one on the path.
+    return int(matches[-1]) if matches else None
+
+
+def has_feature_collection(descriptor: bytes) -> bool:
+    """Whether the descriptor has a feature report inside a UsagePage 0x0b collection."""
+    index = 0
+    usage_page = 0
+    depth = 0
+    vendor_depths = set()
+    while index < len(descriptor):
+        prefix = descriptor[index]
+        index += 1
+        if prefix == 0xFE:  # long item, not used by these mice
+            if index >= len(descriptor):
+                break
+            index += 2 + descriptor[index]
+            continue
+        size = prefix & 0x03
+        size = 4 if size == 3 else size
+        item_type = (prefix >> 2) & 0x03
+        tag = (prefix >> 4) & 0x0F
+        if index + size > len(descriptor):
+            break
+        data = int.from_bytes(descriptor[index:index + size], "little")
+        index += size
+        if item_type == 1 and tag == 0:
+            usage_page = data
+        elif item_type == 0 and tag == 0x0A:  # Collection
+            depth += 1
+            if usage_page == 0x0B or depth - 1 in vendor_depths:
+                vendor_depths.add(depth)
+        elif item_type == 0 and tag == 0x0B and depth in vendor_depths:  # Feature
+            return True
+        elif item_type == 0 and tag == 0x0C:  # End Collection
+            vendor_depths.discard(depth)
+            depth = max(0, depth - 1)
+    return False
+
+
+def find_devices(root: Path = Path("/sys/class/hidraw")) -> dict:
+    """Vendor hidraw nodes of the receiver and the cable interface."""
+    devices = {"receiver": None, "cable": None}
+    hid_ids = {RECEIVER_HID_ID: "receiver", CABLE_HID_ID: "cable"}
+    for node in sorted(root.glob("hidraw*")):
+        device = node / "device"
+        try:
+            uevent = device.joinpath("uevent").read_text()
+            descriptor = device.joinpath("report_descriptor").read_bytes()
+        except OSError:
+            continue
+        hid_id = next((line[7:] for line in uevent.splitlines() if line.startswith("HID_ID=")), "")
+        transport = hid_ids.get(hid_id)
+        if transport is None or usb_interface_number(device) != 2:
+            continue
+        if has_feature_collection(descriptor):
+            devices[transport] = "/dev/" + node.name
+    return devices
+
+
+def hidiocsfeature(length: int) -> int:
+    # _IOC(_IOC_WRITE | _IOC_READ, 'H', 0x06, length)
+    return (3 << 30) | (length << 16) | (ord("H") << 8) | 0x06
+
+
+def decode(report: bytes) -> Optional[dict]:
+    """Event from one input report, or None for reports the widget ignores."""
+    if len(report) < 5 or report[0] != REPORT_ID:
+        return None
+    model, event, b3, b4 = report[1], report[2], report[3], report[4]
+    if event in (EVENT_DPI, EVENT_POLLING):
+        if model not in (0x00, MODEL_X3):
+            return None
+    elif model != MODEL_X3:
+        return None
+    if event in (EVENT_POWER, EVENT_BATTERY):
+        if not 1 <= b4 <= 10:
+            return None
+        return {"event": "power", "state": "asleep" if b3 == 0 else "discharging", "level": b4 * 10}
+    if event == EVENT_DPI and 1 <= b3 <= 8:
+        return {"event": "dpi", "stage": b3}
+    # X3.exe stores b3 directly as the polling index (docs/re/findings.md).
+    if event == EVENT_POLLING and 0 <= b3 <= 3:
+        return {"event": "polling", "index": b3}
+    return None
+
+
+def ack_for(report: bytes) -> Optional[tuple]:
+    """(report id, status) when the input report is a command ACK."""
+    if len(report) < 5 or report[0] != REPORT_ID or report[1] != MODEL_X3 or report[2] != EVENT_ACK:
+        return None
+    return report[4], report[3]
+
+
+def parse_packet(text: str) -> bytes:
+    packet = bytes.fromhex(text)
+    if len(packet) < 3 or packet[0] not in SEND_LENGTHS:
+        raise ValueError(text)
+    if packet[1] != len(packet) or len(packet) != BUILT_LENGTHS[packet[0]]:
+        raise ValueError(text)
+    return packet
+
+
+def wire_packet(packet: bytes) -> bytes:
+    """The exact byte count the X3 firmware declares for this report."""
+    return bytes(packet[:SEND_LENGTHS[packet[0]]])
+
+
+def _drain(fd: int) -> None:
+    while select.select([fd], [], [], 0)[0]:
+        os.read(fd, 64)
+
+
+def _send(fd: int, packet: bytes) -> None:
+    wire = wire_packet(packet)
+    fcntl.ioctl(fd, hidiocsfeature(len(wire)), bytearray(wire))
+
+
+def _wait_ack(fd: int, report_id: int) -> Optional[str]:
+    deadline = time.monotonic() + ACK_SECONDS
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return "timeout"
+        if not select.select([fd], [], [], left)[0]:
+            continue
+        ack = ack_for(os.read(fd, 64))
+        if ack is None or ack[0] != report_id:
+            continue
+        return None if ack[1] == 0 else "rejected"
+
+
+def send_packets(device: str, packets: list, transport: str) -> Optional[str]:
+    """Sends packets over the receiver (with ACK retries) or the cable; error code or None."""
+    fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        for packet in packets:
+            if transport == "cable":
+                _send(fd, packet)
+                time.sleep(CABLE_SETTLE_SECONDS)
+                continue
+            for _attempt in range(ACK_ATTEMPTS):
+                _drain(fd)
+                _send(fd, packet)
+                error = _wait_ack(fd, packet[0])
+                if error is None:
+                    if packet[0] in (0x04, 0x05, 0x08):
+                        print(f"x3-hid: report 0x{packet[0]:02x} acknowledged", file=sys.stderr)
+                    break
+                if error == "rejected":
+                    return "rejected"
+            else:
+                print(f"x3-hid: report 0x{packet[0]:02x} had no ACK after 10 tries", file=sys.stderr)
+                return "timeout"
+    finally:
+        os.close(fd)
+    return None
+
+
+def read_profile(path: Path = PROFILE_PATH) -> Optional[dict]:
+    try:
+        profile = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return profile if isinstance(profile, dict) else None
+
+
+@contextlib.contextmanager
+def profile_lock(path: Path):
+    """Serializes profile reads and writes between concurrent watch/apply helpers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(path.with_suffix(".lock"), "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def write_profile(profile: dict, path: Path) -> None:
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(profile, indent=2) + "\n")
+    temp.replace(path)
+
+
+def save_profile(profile: dict, path: Path = PROFILE_PATH) -> None:
+    with profile_lock(path):
+        write_profile(profile, path)
+
+
+# Same bytes as report6() in Model.js, which builds them for `apply`; this
+# copy lets `watch` prime the receiver without the QML side. Both are pinned
+# to the same hex by tests/test_x3_hid.py and tests/tst_model.qml.
+def polling_packet(index: int) -> bytes:
+    interval = [8, 4, 2, 1][index]
+    return bytes([0x06, 0x09, 0x01, interval, (~interval) & 0xFF, 0, 0, 0, 0])
+
+
+def saved_polling_packet(path: Path = PROFILE_PATH) -> bytes:
+    profile = read_profile(path)
+    index = profile.get("polling", 3) if profile is not None else 3
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index <= 3:
+        index = 3
+    return polling_packet(index)
+
+
+def prime_receiver(fds: dict, receiver: str, profile_path: Path = PROFILE_PATH) -> None:
+    """Sends the saved polling report once, without waiting for an ACK."""
+    fd = next((fd for fd, path in fds.items() if path == receiver), None)
+    if fd is not None:
+        _send(fd, saved_polling_packet(profile_path))
+
+
+def apply(args: list, profile_path: Path = PROFILE_PATH) -> dict:
+    try:
+        profile = json.loads(args[0])
+        packets = [parse_packet(text) for text in args[1:]]
+    except (IndexError, ValueError):
+        return {"ok": False, "error": "invalid"}
+    if not isinstance(profile, dict) or not packets:
+        return {"ok": False, "error": "invalid"}
+    devices = find_devices()
+    if devices["cable"] is not None:
+        device, transport = devices["cable"], "cable"
+    elif devices["receiver"] is not None:
+        device, transport = devices["receiver"], "receiver"
+    else:
+        return {"ok": False, "error": "missing"}
+    before = read_profile(profile_path)
+    try:
+        error = send_packets(device, packets, transport)
+    except PermissionError:
+        return {"ok": False, "error": "access-denied"}
+    except OSError:
+        return {"ok": False, "error": "missing"}
+    if error is not None:
+        return {"ok": False, "error": error}
+    # A mouse-made DPI/polling change can be saved by `watch` while this
+    # apply waits for ACKs. That write holds the newer in-memory profile, so
+    # the successful apply must not overwrite it with the older job copy.
+    with profile_lock(profile_path):
+        current = read_profile(profile_path)
+        write_profile(current if current != before and current is not None else profile, profile_path)
+    return {"ok": True}
+
+
+def emit(message: dict, last: list) -> None:
+    if last and last[0] == message:
+        return
+    last[:] = [message]
+    print(json.dumps(message), flush=True)
+
+
+def charging_message(device: str, last_power: Optional[dict]) -> dict:
+    """Power line synthesized from the presence of the cable interface."""
+    message = {"ok": True, "event": "power", "device": device,
+               "transport": "cable", "state": "charging"}
+    if last_power is not None:
+        message["level"] = last_power["level"]
+    return message
+
+
+def _close_all(fds: dict) -> None:
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    fds.clear()
+
+
+def _open_inputs(devices: dict) -> dict:
+    fds = {}
+    try:
+        for path in (devices["receiver"], devices["cable"]):
+            if path is not None:
+                fds[os.open(path, os.O_RDWR | os.O_NONBLOCK)] = path
+    except Exception:
+        _close_all(fds)
+        raise
+    return fds
+
+
+def watch(profile_path: Path = PROFILE_PATH) -> int:
+    last: list = []
+    fds: dict = {}
+    paths_key = None
+    last_power: Optional[dict] = None
+    cable_reported = False
+    heard = time.monotonic()
+    try:
+        while True:
+            devices = find_devices()
+            if devices["cable"] is None:
+                cable_reported = False
+            elif not cable_reported:
+                # The receiver carries no charging state and goes quiet on
+                # the cable, so the presence of fa61 is the charging signal.
+                # It is visible in sysfs even when opening hidraw fails.
+                emit(charging_message(devices["cable"], last_power), last)
+                cable_reported = True
+            key = (devices["receiver"], devices["cable"])
+            if key != paths_key:
+                _close_all(fds)
+                paths_key = None
+                if key == (None, None):
+                    emit({"ok": False, "error": "missing"}, last)
+                    time.sleep(RETRY_SECONDS)
+                    continue
+                try:
+                    fds = _open_inputs(devices)
+                except PermissionError:
+                    emit({"ok": False, "error": "access-denied"}, last)
+                    time.sleep(RETRY_SECONDS)
+                    continue
+                except FileNotFoundError:
+                    emit({"ok": False, "error": "missing"}, last)
+                    time.sleep(RETRY_SECONDS)
+                    continue
+                paths_key = key
+                heard = time.monotonic()
+                if devices["receiver"] is not None:
+                    try:
+                        prime_receiver(fds, devices["receiver"], profile_path)
+                    except OSError as error:
+                        print(f"x3-hid: could not send the polling report on {devices['receiver']}: {error}", file=sys.stderr)
+
+            if not fds:
+                time.sleep(RETRY_SECONDS)
+                continue
+            try:
+                ready, _, _ = select.select(list(fds), [], [], 1.0)
+            except OSError:
+                paths_key = None
+                continue
+            now = time.monotonic()
+            if not ready:
+                if devices["cable"] is None and now - heard >= SILENCE_SECONDS:
+                    emit({"ok": False, "error": "asleep"}, last)
+                continue
+            for fd in ready:
+                try:
+                    report = os.read(fd, 64)
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    if error.errno not in (errno.ENODEV, errno.EIO, errno.ENOENT):
+                        raise
+                    paths_key = None
+                    break
+                if not report:
+                    paths_key = None
+                    break
+                heard = now
+                message = decode(report)
+                if message is None:
+                    continue
+                transport = "cable" if devices["cable"] is not None else "receiver"
+                if message["event"] == "power":
+                    last_power = dict(message)
+                    if transport == "cable":
+                        message["state"] = "charging"
+                emit({"ok": True, "device": fds[fd], "transport": transport, **message}, last)
+    finally:
+        _close_all(fds)
+
+
+def split_profile_args(argv: list) -> Optional[tuple]:
+    """(--profile-path PATH, command args); the service passes one canonical path."""
+    args = argv[1:]
+    profile_path = PROFILE_PATH
+    if args[:1] == ["--profile-path"]:
+        if len(args) < 3:
+            return None
+        profile_path = Path(args[1])
+        args = args[2:]
+    return profile_path, args
+
+
+def main(argv: list) -> int:
+    parsed = split_profile_args(argv)
+    if parsed is None:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    profile_path, args = parsed
+    if args == ["watch"]:
+        try:
+            return watch(profile_path)
+        except KeyboardInterrupt:
+            return 0
+    if len(args) == 2 and args[0] == "save":
+        try:
+            profile = json.loads(args[1])
+        except ValueError:
+            profile = None
+        if not isinstance(profile, dict):
+            print(json.dumps({"ok": False, "error": "invalid"}), flush=True)
+            return 1
+        save_profile(profile, profile_path)
+        print(json.dumps({"ok": True}), flush=True)
+        return 0
+    if len(args) >= 1 and args[0] == "apply":
+        result = apply(args[1:], profile_path)
+        print(json.dumps(result), flush=True)
+        return 0 if result["ok"] else 1
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

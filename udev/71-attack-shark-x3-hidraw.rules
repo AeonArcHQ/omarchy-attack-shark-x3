@@ -1,0 +1,4 @@
+# ATTACK SHARK X3 receiver and cable: allow the active local session
+# access to the vendor interface only.
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1d57", ENV{ID_MODEL_ID}=="fa60", ENV{ID_USB_INTERFACE_NUM}=="02", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="1d57", ENV{ID_MODEL_ID}=="fa61", ENV{ID_USB_INTERFACE_NUM}=="02", TAG+="uaccess"
