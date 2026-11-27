@@ -202,6 +202,8 @@ Panel {
             }
             Row {
               spacing: Style.space(8)
+              // The colours edit the selected stage: keep them away from "Active stages".
+              bottomPadding: Style.space(24)
               Repeater {
                 model: Model.COLOR_PRESETS
                 delegate: Rectangle {
