@@ -71,7 +71,8 @@ Panel {
     function toggle(): void { root.toggle() }
     function togglePercentage(): void { root.togglePercentage() }
     function status(): string { return x3.battery.connection + " " + x3.battery.level }
-    function resetDefaults(): string { x3.resetDefaults(); return "ok" }
+    function state(): string { return Model.stateJson(x3.busy, x3.lastError, x3.profile, x3.stageKnown, x3.battery) }
+    function resetDefaults(): string { x3.resetDefaults(); return "sent" }
     // e.g. set polling 2, set stage 0, set deepSleep 10
     function set(path: string, value: string): string {
       var parsed = null

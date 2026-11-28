@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""Compare the X3 and M900 panel borders by measuring screenshot pixels.
+
+The importable functions below work on RGB byte buffers and are covered by
+tests/test_panel_check.py. main() is only the live-shell plumbing: IPC open
+and close, grim captures, and ImageMagick's PNG-to-RGB conversion.
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+X3_TARGET = "com.aeonarc.attack-shark-x3"
+M900_TARGET = "com.aeonarc.delux-m900"
+TARGETS = (X3_TARGET, M900_TARGET)
+MIN_RUN = 30
+# A channel change at least this large marks a pixel as changed between the
+# closed and open captures.
+DIFF_THRESHOLD = 12
+# The panel's scroll clip can cut the last control: its side edges then reach
+# the bottom of the analyzed region, within this many pixels, with no bottom.
+CUT_TOLERANCE = 4
+
+
+def grey(p):
+    r, g, b = p
+    return 70 <= r <= 140 and abs(r - g) < 8 and abs(r - b) < 8
+
+
+def _offset(width, x, y):
+    return (y * width + x) * 3
+
+
+def pixel(data, width, x, y):
+    i = _offset(width, x, y)
+    return data[i], data[i + 1], data[i + 2]
+
+
+def is_grey(data, width, height, x, y):
+    return 0 <= x < width and 0 <= y < height and grey(pixel(data, width, x, y))
+
+
+def grey_runs_in_row(data, width, height, y, x0=0, x1=None, min_length=MIN_RUN):
+    """Inclusive horizontal runs of grey pixels on one row."""
+    if x1 is None:
+        x1 = width
+    x0 = max(0, x0)
+    x1 = min(width, x1)
+    runs = []
+    start = None
+    for x in range(x0, x1):
+        if is_grey(data, width, height, x, y):
+            if start is None:
+                start = x
+        elif start is not None:
+            if x - start >= min_length:
+                runs.append((start, x - 1))
+            start = None
+    if start is not None and x1 - start >= min_length:
+        runs.append((start, x1 - 1))
+    return runs
+
+
+def longest_grey_run(data, width, height, y, x0, x1):
+    """Longest grey run inside the inclusive x span [x0, x1]."""
+    best = 0
+    current = 0
+    for x in range(max(0, x0), min(width - 1, x1) + 1):
+        if is_grey(data, width, height, x, y):
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return best
+
+
+def _vertical_probe_rows(height, y):
+    return range(y + 5, min(height, y + 16))
+
+
+def edge_present(data, width, height, x, y):
+    """The appendix edge probe: x-1..x+1, eight pixels below the top run."""
+    probe_y = y + 8
+    return any(is_grey(data, width, height, xx, probe_y) for xx in range(x - 1, x + 2))
+
+
+def estimate_vertical_edge_column(data, width, height, x, y, side):
+    """Estimate the vertical-border column within three pixels of a run end.
+
+    This estimate is only for measuring width and finding the bottom edge; it
+    never decides whether the edge itself is drawn. The three-pixel limit keeps
+    a neighboring control or the panel frame from being measured as this edge.
+    """
+    if side == "left":
+        candidates = range(x, x - 4, -1)
+    else:
+        candidates = range(x, x + 4)
+    rows = list(_vertical_probe_rows(height, y))
+    best_x = None
+    best_rows = 0
+    for xx in candidates:
+        exact_rows = sum(1 for yy in rows if is_grey(data, width, height, xx, yy))
+        if exact_rows > best_rows:
+            best_rows = exact_rows
+            best_x = xx
+    if best_x is not None and best_rows >= 4:
+        return best_x
+    return None
+
+
+def vertical_extent(data, width, height, x, y, max_height=100):
+    """Last row of the vertical grey segment at column x below y."""
+    last = y
+    misses = 0
+    started = False
+    for yy in range(y + 1, min(height, y + max_height + 1)):
+        if is_grey(data, width, height, x, yy):
+            last = yy
+            misses = 0
+            started = True
+        elif started:
+            misses += 1
+            if misses >= 3:
+                break
+    return last
+
+
+def measure_control(data, width, height, run_start, run_end, y, region_bottom=None):
+    """Measure one candidate bordered control from its top-edge run.
+
+    region_bottom is the exclusive bottom of the analyzed region. A control
+    whose side edges run into it without a bottom edge is marked cut: the
+    panel's scroll clip hides its bottom, which is not a missing edge.
+    """
+    if region_bottom is None:
+        region_bottom = height
+    left = edge_present(data, width, height, run_start, y)
+    right = edge_present(data, width, height, run_end, y)
+    left_column = estimate_vertical_edge_column(data, width, height, run_start, y, "left")
+    right_column = estimate_vertical_edge_column(data, width, height, run_end, y, "right")
+
+    x = left_column if left_column is not None else run_start
+    right_x = right_column if right_column is not None else run_end
+    estimates = []
+    if left_column is not None:
+        estimates.append(vertical_extent(data, width, height, left_column, y))
+    if right_column is not None:
+        estimates.append(vertical_extent(data, width, height, right_column, y))
+
+    if estimates:
+        estimated_end = max(estimates)
+        low = max(y + 10, estimated_end - 2)
+        high = min(height - 1, estimated_end + 10, y + 90)
+    else:
+        estimated_end = y + 35
+        low = min(height - 1, y + 16)
+        high = min(height - 1, y + 45)
+
+    control_width = right_x - x + 1
+    needed = max(MIN_RUN, int(control_width * 0.55))
+    bottom_y = None
+    for yy in range(low, high + 1):
+        if longest_grey_run(data, width, height, yy, x, right_x) >= needed:
+            bottom_y = yy
+            break
+
+    bottom = bottom_y is not None
+    cut = not bottom and bool(estimates) and estimated_end >= region_bottom - 1 - CUT_TOLERANCE
+    height_px = (bottom_y if bottom else estimated_end) - y + 1
+    return {
+        "x": x,
+        "y": y,
+        "right": right_x,
+        "width": control_width,
+        "height": height_px,
+        "run_start": run_start,
+        "run_end": run_end,
+        "cut": cut,
+        "edges": {
+            "left": left,
+            "right": right,
+            "top": True,
+            "bottom": bottom,
+        },
+    }
+
+
+def _overlap_width(a, b):
+    return min(a["right"], b["right"]) - max(a["x"], b["x"]) + 1
+
+
+def _duplicate(a, b):
+    overlap = _overlap_width(a, b)
+    if overlap <= 0 or overlap / max(1, min(a["width"], b["width"])) < 0.5:
+        return False
+    if abs(a["y"] - b["y"]) <= 2:
+        return True
+    # A bottom edge is itself a long horizontal grey run. It is not a new
+    # control when it lies inside the vertical span of an overlapping control
+    # already found from its top edge.
+    return b["y"] < a["y"] <= b["y"] + b["height"] + 2
+
+
+def plausible_control(measurement):
+    """Separators and bare horizontal lines have no vertical or bottom edge."""
+    edges = measurement["edges"]
+    return measurement["width"] >= MIN_RUN and (edges["left"] or edges["right"] or edges["bottom"])
+
+
+def group_rows(controls, tolerance=4):
+    """Group controls whose top edges share a row, top to bottom."""
+    rows = []
+    for control in sorted(controls, key=lambda item: (item["y"], item["x"])):
+        if not rows or abs(control["y"] - rows[-1][0]["y"]) > tolerance:
+            rows.append([])
+        rows[-1].append(control)
+    return rows
+
+
+def analyze_controls(data, width, height, region=None, min_run=MIN_RUN):
+    """Bordered controls in an RGB buffer, grouped in rows.
+
+    region is (left, top, right, bottom), with right and bottom exclusive.
+    """
+    if region is None:
+        x0, y0, x1, y1 = 0, 0, width, height
+    else:
+        x0, y0, x1, y1 = region
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(width, x1)
+        y1 = min(height, y1)
+    measurements = []
+    for y in range(y0, y1):
+        for start, end in grey_runs_in_row(data, width, height, y, x0, x1, min_run):
+            measurements.append(measure_control(data, width, height, start, end, y, y1))
+
+    deduped = []
+    for measurement in sorted(measurements, key=lambda item: (item["y"], item["x"])):
+        if any(_duplicate(measurement, kept) for kept in deduped):
+            continue
+        deduped.append(measurement)
+    controls = [measurement for measurement in deduped if plausible_control(measurement)]
+    return group_rows(controls)
+
+
+def _changed(before, after, i):
+    return any(abs(after[i + c] - before[i + c]) >= DIFF_THRESHOLD for c in range(3))
+
+
+def frame_from_difference(before, after, width, height):
+    """Bounding box of the largest changed rectangular region.
+
+    The panel is the only large object appearing between the closed and open
+    captures, so row and column projections are enough and avoid depending on
+    a theme color.
+    """
+    if len(before) != len(after) or len(before) != width * height * 3:
+        raise ValueError("RGB buffers must have equal width*height*3 bytes")
+    row_counts = [0] * height
+    for y in range(height):
+        base = y * width * 3
+        count = 0
+        for i in range(base, base + width * 3, 3):
+            if _changed(before, after, i):
+                count += 1
+        row_counts[y] = count
+
+    def segments(counts):
+        peak = max(counts, default=0)
+        if peak < 20:
+            return []
+        threshold = max(20, peak // 5)
+        out = []
+        start = None
+        end = None
+        total = 0
+        gaps = 0
+        for index, count in enumerate(counts + [0, 0, 0]):
+            if count >= threshold:
+                if start is None:
+                    start = index
+                    total = 0
+                end = index
+                total += count
+                gaps = 0
+            elif start is not None:
+                gaps += 1
+                if gaps > 2:
+                    out.append((start, end, total))
+                    start = None
+                    gaps = 0
+        return out
+
+    row_segments = segments(row_counts)
+    if not row_segments:
+        return None
+    y0, y1, _total = max(row_segments, key=lambda item: item[2])
+
+    column_counts = [0] * width
+    for x in range(width):
+        count = 0
+        for y in range(y0, y1 + 1):
+            if _changed(before, after, _offset(width, x, y)):
+                count += 1
+        column_counts[x] = count
+    column_segments = segments(column_counts)
+    if not column_segments:
+        return None
+    x0, x1, _total = max(column_segments, key=lambda item: item[2])
+
+    # Anti-aliased frame pixels often fall just below the diff threshold.
+    x0 = max(0, x0 - 1)
+    y0 = max(0, y0 - 1)
+    x1 = min(width - 1, x1 + 1)
+    y1 = min(height - 1, y1 + 1)
+    return {"x": x0, "y": y0, "width": x1 - x0 + 1, "height": y1 - y0 + 1}
+
+
+def png_size(path):
+    data = Path(path).read_bytes()[:24]
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        raise ValueError(f"{path} is not a PNG")
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def read_rgb(path):
+    width, height = png_size(path)
+    result = subprocess.run(
+        ["magick", str(path), "-alpha", "off", "-depth", "8", "rgb:-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"magick failed for {path}")
+    data = result.stdout
+    if len(data) != width * height * 3:
+        raise RuntimeError(f"magick returned {len(data)} bytes for {width}x{height}")
+    return data, width, height
+
+
+def analyze_capture(before_path, after_path):
+    before, width, height = read_rgb(before_path)
+    after, after_width, after_height = read_rgb(after_path)
+    if (after_width, after_height) != (width, height):
+        raise RuntimeError("the before/after captures have different dimensions")
+    frame = frame_from_difference(before, after, width, height)
+    if frame is None:
+        return {"frame": None, "rows": []}
+    inset = 4
+    region = (frame["x"] + inset, frame["y"] + inset,
+              frame["x"] + frame["width"] - inset, frame["y"] + frame["height"] - inset)
+    rows = analyze_controls(after, width, height, region)
+    return {"frame": frame, "rows": rows}
+
+
+def format_report(target, result):
+    lines = [f"== {target} =="]
+    frame = result["frame"]
+    if frame is None:
+        lines.append("frame: not found")
+        return "\n".join(lines)
+    lines.append(
+        "frame: x={x} y={y} width={width} height={height}".format(**frame))
+    lefts = [control["x"] for row in result["rows"] for control in row]
+    margin = min(lefts) - frame["x"] if lefts else None
+    lines.append("content left margin: " + (f"{margin}px" if margin is not None else "n/a"))
+    lines.append("row  button  x     y     width  height  left  right  top  bottom")
+    for row_index, row in enumerate(result["rows"], 1):
+        lines.append(f"row {row_index}: {len(row)} button(s)")
+        for button_index, control in enumerate(row, 1):
+            edges = control["edges"]
+            marks = {side: ("yes" if edges[side] else "NO") for side in ("left", "right", "top", "bottom")}
+            if control.get("cut"):
+                marks["bottom"] = "cut"
+            lines.append(
+                f"{row_index:>3}  {button_index:>6}  {control['x']:>5}  {control['y']:>5}  "
+                f"{control['width']:>5}  {control['height']:>6}  "
+                f"{marks['left']:>4}  {marks['right']:>5}  {marks['top']:>3}  {marks['bottom']:>6}")
+    return "\n".join(lines)
+
+
+def missing_edges(rows):
+    missing = []
+    for row_index, row in enumerate(rows, 1):
+        for button_index, control in enumerate(row, 1):
+            for side, drawn in control["edges"].items():
+                if not drawn and not (side == "bottom" and control.get("cut")):
+                    missing.append((row_index, button_index, side))
+    return missing
+
+
+def _run(command, quiet=False):
+    return subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL if quiet else subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+
+
+def close_targets():
+    for target in TARGETS:
+        subprocess.run(["omarchy-shell", target, "close"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+
+
+def capture_panel(target, directory):
+    label = "x3" if target == X3_TARGET else "m900"
+    before = Path(directory) / f"{label}-before.png"
+    after = Path(directory) / f"{label}.png"
+    close_targets()
+    time.sleep(0.45)
+    _run(["grim", str(before)], quiet=True)
+    try:
+        _run(["omarchy-shell", target, "open"], quiet=True)
+        time.sleep(0.8)
+        _run(["grim", str(after)], quiet=True)
+    finally:
+        close_targets()
+    return before, after
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out", help="directory where the PNG captures are kept")
+    parser.add_argument("--only", choices=["x3"], help="check only one panel")
+    args = parser.parse_args(argv)
+
+    targets = [X3_TARGET] if args.only == "x3" else list(TARGETS)
+    temporary = None
+    if args.out:
+        directory = Path(args.out)
+        directory.mkdir(parents=True, exist_ok=True)
+    else:
+        temporary = tempfile.TemporaryDirectory(prefix="x3-panel-check-")
+        directory = Path(temporary.name)
+
+    exit_code = 0
+    try:
+        for target in targets:
+            result = analyze_capture(*capture_panel(target, directory))
+            print(format_report(target, result))
+            if target == X3_TARGET:
+                missing = missing_edges(result["rows"])
+                if result["frame"] is None:
+                    print("x3 missing edges: panel frame not found", file=sys.stderr)
+                    exit_code = 1
+                elif missing:
+                    print("x3 missing edges: " + ", ".join(
+                        f"row {row} button {button} {side}" for row, button, side in missing), file=sys.stderr)
+                    exit_code = 1
+    except (OSError, subprocess.CalledProcessError, RuntimeError, ValueError) as error:
+        print(f"panel-check: {error}", file=sys.stderr)
+        exit_code = 2
+    finally:
+        close_targets()
+        if temporary is not None:
+            temporary.cleanup()
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

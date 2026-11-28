@@ -116,6 +116,22 @@ TestCase {
     compare(Model.barView(m, true, function(n) { return "<" + n + ">" }).label, "<40>%")
   }
 
+  function test_state_json_has_the_ipc_shape_with_a_one_based_stage() {
+    var p = Model.normalizeProfile({ stage: 3, stageKnown: true })
+    var b = Model.applyLine(null, line({ ok: true, event: "power", state: "discharging", level: 40, transport: "receiver" }))
+    var state = JSON.parse(Model.stateJson(true, "The mouse is asleep. Move it and try again.", p, true, b))
+    compare(state, {
+      busy: true,
+      error: "The mouse is asleep. Move it and try again.",
+      stage: 4,
+      stageKnown: true,
+      battery: 40,
+      connection: "ready"
+    })
+    var empty = JSON.parse(Model.stateJson(false, "", Model.normalizeProfile(null), false, null))
+    compare(empty, { busy: false, error: "", stage: 2, stageKnown: false, battery: -1, connection: "starting" })
+  }
+
   function test_factory_report8_matches_the_factory_bytes() {
     compare(Model.report8(Model.FACTORY_BUTTONS),
       "083b01" + "020000" + "030000" + "040000" + "0d0000" + "3c0000" + "0f0000"
