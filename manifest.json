@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "com.aeonarc.attack-shark-x3",
+  "name": "Attack Shark X3",
+  "version": "1.0.0",
+  "author": "Aeon Arc",
+  "license": "MIT",
+  "description": "Battery, DPI, polling rate, sensor and button settings of the ATTACK SHARK X3 wireless mouse in the Omarchy bar, over its 2.4G receiver or USB cable and without the Windows driver.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "MousePanel.qml"
+  },
+  "barWidget": {
+    "displayName": "Attack Shark X3",
+    "description": "Battery level of the ATTACK SHARK X3 mouse; click for DPI, polling, sensor, timing and button settings. Needs the udev rule from the plugin's README.",
+    "category": "Devices",
+    "aliases": ["attack shark", "x3", "mouse", "mouse battery"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showPercentage": true
+    },
+    "schema": [
+      {
+        "key": "showPercentage",
+        "type": "boolean",
+        "label": "Show percentage",
+        "description": "Show the battery percentage next to the mouse glyph. Off leaves only the glyph; the tooltip still has the level.",
+        "defaultValue": true
+      }
+    ]
+  }
+}
