@@ -33,9 +33,10 @@ cable (`1d57:fa61`), without the Windows driver.
 - While asleep, the mouse does not respond: the panel asks you to move it
   and try again.
 - IPC: `omarchy-shell com.aeonarc.attack-shark-x3
-  toggle|open|close|status|resetDefaults|lastError` and
+  toggle|open|close|status|state|resetDefaults|lastError` and
   `set <field> <json>`, for example `set polling 2`, `set stage 0` or
-  `set deepSleep 10`.
+  `set deepSleep 10`. `state` returns one JSON object with `busy`, `error`,
+  the one-based `stage`, `stageKnown`, `battery` and `connection`.
 
 ## Receiver versus cable
 

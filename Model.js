@@ -119,6 +119,24 @@ function statusLine(model, formatTime, profile, stageKnown) {
   return notice
 }
 
+// The machine-readable state exposed over IPC. `stage` is one-based because
+// it is for people and scripts outside the panel; the profile stores it
+// zero-based for report 0x04.
+function stateJson(busy, error, profile, stageKnown, battery) {
+  var p = profile || normalizeProfile(null)
+  var b = battery || emptyBattery()
+  var level = Number(b.level)
+  if (!isFinite(level)) level = -1
+  return JSON.stringify({
+    busy: !!busy,
+    error: String(error || ""),
+    stage: clamp(p.stage, 0, USER_STAGES - 1) + 1,
+    stageKnown: stageKnown === true,
+    battery: Math.round(level),
+    connection: String(b.connection || "starting")
+  })
+}
+
 // ---------- Configuration (feature reports, docs/re/findings.md) ----------
 
 // The firmware report carries eight DPI slots; only the first six are user

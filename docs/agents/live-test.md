@@ -17,3 +17,9 @@ How to try a change on the running bar and the real mouse.
 ## The screen
 
 The laptop screen runs at scale 1.25, so a panel can start at a fractional x and a 1 px border can vanish there. Judge borders and spacing by measuring pixels, against the M900 panel, rather than by eye.
+
+## Tools
+
+- `tools/panel-check`: run before calling a UI change done; it captures the X3 and M900 panels, measures the frame and bordered buttons, and fails when an X3 button edge is missing.
+- `tools/listen.py`: run when you need the receiver's live report-3 events (power, DPI, polling, ACK) without sending anything to the mouse.
+- `state` IPC (`omarchy-shell com.aeonarc.attack-shark-x3 state`): use when a script needs the panel's `busy`, `error`, stage, battery and connection as JSON.
