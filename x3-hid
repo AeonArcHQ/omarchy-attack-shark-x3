@@ -27,14 +27,16 @@ b4, in steps of ten percent. See docs/re/findings.md for the evidence.
 The mouse cannot be read back (X3.exe never asks for a feature report), so
 the saved profile is the only record of what was last applied. Model.js
 builds the reports for `apply`; `watch` sends the saved polling report once
-when the receiver opens because DPI events only start after that report.
+a receiver reports the X3 model because DPI events only start after that
+report.
 
 Error codes: missing (no receiver or cable vendor interface), access-denied
 (no permission on the hidraw node), asleep (receiver present, mouse silent
-for SILENCE_SECONDS), timeout (no ACK over the receiver after the retries,
-for every report; only the priming send of `watch` ignores a missing ACK),
-rejected (ACK with a non-zero status), invalid
-(bad arguments).
+for SILENCE_SECONDS), timeout (no X3 report during the receiver check, or no
+ACK over the receiver after the retries, for every report; only the priming
+send of `watch` ignores a missing ACK), other-mouse (the only receiver
+candidate answered with another model), rejected (ACK with a non-zero
+status), invalid (bad arguments).
 """
 
 from __future__ import annotations
@@ -55,6 +57,9 @@ RECEIVER_HID_ID = "0003:00001D57:0000FA60"
 CABLE_HID_ID = "0003:00001D57:0000FA61"
 REPORT_ID = 0x03
 MODEL_X3 = 0x10
+# X3.exe matches DPI and polling events with model 0x00; whether the X3
+# firmware sends 0x00 or 0x10 on them is unknown (docs/re/findings.md).
+MODEL_UNSET = 0x00
 EVENT_DPI = 0x10
 EVENT_POLLING = 0x20
 EVENT_POWER = 0x40
@@ -119,8 +124,8 @@ def has_feature_collection(descriptor: bytes) -> bool:
 
 
 def find_devices(root: Path = Path("/sys/class/hidraw")) -> dict:
-    """Vendor hidraw nodes of the receiver and the cable interface."""
-    devices = {"receiver": None, "cable": None}
+    """Vendor hidraw nodes: every receiver candidate, plus the cable interface."""
+    devices = {"receiver": [], "cable": None}
     hid_ids = {RECEIVER_HID_ID: "receiver", CABLE_HID_ID: "cable"}
     for node in sorted(root.glob("hidraw*")):
         device = node / "device"
@@ -134,8 +139,81 @@ def find_devices(root: Path = Path("/sys/class/hidraw")) -> dict:
         if transport is None or usb_interface_number(device) != 2:
             continue
         if has_feature_collection(descriptor):
-            devices[transport] = "/dev/" + node.name
+            if transport == "receiver":
+                devices["receiver"].append("/dev/" + node.name)
+            else:
+                devices["cable"] = "/dev/" + node.name
     return devices
+
+
+def receiver_nodes(devices: dict) -> list:
+    """Receiver candidates as a list."""
+    return list(devices.get("receiver") or [])
+
+
+def report_model(report: bytes) -> Optional[int]:
+    """Model byte of an input report 3, or None for anything else."""
+    if len(report) < 2 or report[0] != REPORT_ID:
+        return None
+    return report[1]
+
+
+def confirm_x3(candidates: list, budget: float = ACK_ATTEMPTS * ACK_SECONDS,
+               open_node=None, select_ready=None, clock=None) -> tuple:
+    """(node, error) after listening for an X3 report; never writes to a node.
+
+    All candidates are opened read-only and watched together. A report 3 with
+    model 0x10 confirms its node. When the only candidate reports another
+    model the receiver is known to belong to another mouse, so the check ends
+    early with `other-mouse`; with several candidates an asleep X3 may still
+    wake before the budget ends, so the wait continues and only then reports
+    `other-mouse` when every report 3 seen carried another model.
+    """
+    open_node = open_node or os.open
+    select_ready = select_ready or select.select
+    clock = clock or time.monotonic
+    fds = {}
+    try:
+        for path in candidates:
+            fds[open_node(path, os.O_RDONLY | os.O_NONBLOCK)] = path
+        if not fds:
+            return None, "missing"
+        deadline = clock() + budget
+        saw_other = False
+        saw_inconclusive = False
+        while True:
+            left = deadline - clock()
+            if left <= 0:
+                return None, "other-mouse" if saw_other and not saw_inconclusive else "timeout"
+            ready = select_ready(list(fds), [], [], left)[0]
+            for fd in ready:
+                try:
+                    report = os.read(fd, 64)
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    if error.errno not in (errno.ENODEV, errno.EIO, errno.ENOENT):
+                        raise
+                    report = b""
+                if not report:
+                    # A receiver unplugged during the check stops being a
+                    # candidate; the others still have the full budget.
+                    _close_quietly(fd)
+                    del fds[fd]
+                    if not fds:
+                        return None, "missing"
+                    continue
+                model = report_model(report)
+                if model == MODEL_X3:
+                    return fds[fd], None
+                if model == MODEL_UNSET:
+                    saw_inconclusive = True
+                elif model is not None:
+                    saw_other = True
+                    if len(candidates) == 1:
+                        return None, "other-mouse"
+    finally:
+        _close_all(fds)
 
 
 def hidiocsfeature(length: int) -> int:
@@ -149,7 +227,7 @@ def decode(report: bytes) -> Optional[dict]:
         return None
     model, event, b3, b4 = report[1], report[2], report[3], report[4]
     if event in (EVENT_DPI, EVENT_POLLING):
-        if model not in (0x00, MODEL_X3):
+        if model not in (MODEL_UNSET, MODEL_X3):
             return None
     elif model != MODEL_X3:
         return None
@@ -301,10 +379,19 @@ def apply(args: list, profile_path: Path = PROFILE_PATH) -> dict:
     if not isinstance(profile, dict) or not packets:
         return {"ok": False, "error": "invalid"}
     devices = find_devices()
+    receivers = receiver_nodes(devices)
     if devices["cable"] is not None:
         device, transport = devices["cable"], "cable"
-    elif devices["receiver"] is not None:
-        device, transport = devices["receiver"], "receiver"
+    elif receivers:
+        transport = "receiver"
+        try:
+            device, error = confirm_x3(receivers)
+        except PermissionError:
+            return {"ok": False, "error": "access-denied"}
+        except OSError:
+            return {"ok": False, "error": "missing"}
+        if error is not None:
+            return {"ok": False, "error": error}
     else:
         return {"ok": False, "error": "missing"}
     before = read_profile(profile_path)
@@ -341,21 +428,24 @@ def charging_message(device: str, last_power: Optional[dict]) -> dict:
     return message
 
 
+def _close_quietly(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def _close_all(fds: dict) -> None:
     for fd in fds:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        _close_quietly(fd)
     fds.clear()
 
 
 def _open_inputs(devices: dict) -> dict:
     fds = {}
     try:
-        for path in (devices["receiver"], devices["cable"]):
-            if path is not None:
-                fds[os.open(path, os.O_RDWR | os.O_NONBLOCK)] = path
+        for path in receiver_nodes(devices) + ([devices["cable"]] if devices["cable"] is not None else []):
+            fds[os.open(path, os.O_RDWR | os.O_NONBLOCK)] = path
     except Exception:
         _close_all(fds)
         raise
@@ -368,10 +458,12 @@ def watch(profile_path: Path = PROFILE_PATH) -> int:
     paths_key = None
     last_power: Optional[dict] = None
     cable_reported = False
+    primed_receivers = set()
     heard = time.monotonic()
     try:
         while True:
             devices = find_devices()
+            receivers = receiver_nodes(devices)
             if devices["cable"] is None:
                 cable_reported = False
             elif not cable_reported:
@@ -380,11 +472,12 @@ def watch(profile_path: Path = PROFILE_PATH) -> int:
                 # It is visible in sysfs even when opening hidraw fails.
                 emit(charging_message(devices["cable"], last_power), last)
                 cable_reported = True
-            key = (devices["receiver"], devices["cable"])
+            key = (tuple(receivers), devices["cable"])
             if key != paths_key:
                 _close_all(fds)
                 paths_key = None
-                if key == (None, None):
+                primed_receivers = set()
+                if key == ((), None):
                     emit({"ok": False, "error": "missing"}, last)
                     time.sleep(RETRY_SECONDS)
                     continue
@@ -400,11 +493,6 @@ def watch(profile_path: Path = PROFILE_PATH) -> int:
                     continue
                 paths_key = key
                 heard = time.monotonic()
-                if devices["receiver"] is not None:
-                    try:
-                        prime_receiver(fds, devices["receiver"], profile_path)
-                    except OSError as error:
-                        print(f"x3-hid: could not send the polling report on {devices['receiver']}: {error}", file=sys.stderr)
 
             if not fds:
                 time.sleep(RETRY_SECONDS)
@@ -432,7 +520,18 @@ def watch(profile_path: Path = PROFILE_PATH) -> int:
                 if not report:
                     paths_key = None
                     break
-                heard = now
+                path = fds[fd]
+                model = report_model(report)
+                if path == devices["cable"] or model in (MODEL_UNSET, MODEL_X3):
+                    heard = now
+                # The polling prime is a feature write too, so it waits for a
+                # report that confirms this receiver belongs to the X3.
+                if path in receivers and path not in primed_receivers and model == MODEL_X3:
+                    primed_receivers.add(path)
+                    try:
+                        prime_receiver(fds, path, profile_path)
+                    except OSError as error:
+                        print(f"x3-hid: could not send the polling report on {path}: {error}", file=sys.stderr)
                 message = decode(report)
                 if message is None:
                     continue

@@ -391,6 +391,7 @@ function dpiLabel(dpi) {
 // What the panel says when `x3-hid apply` fails.
 var APPLY_ERRORS = {
   timeout: "The mouse is asleep. Move it and try again.",
+  "other-mouse": "Another mouse's receiver is plugged in. Plug in the X3 receiver.",
   rejected: "The mouse rejected the settings.",
   missing: "Receiver and cable disconnected.",
   "access-denied": "No permission on the mouse interface. Install the udev rule from the README.",

@@ -23,8 +23,8 @@ MOUSE_COLLECTION = bytes.fromhex("05010902a1010901a100850105091901")
 POLLING_HEX = ["06090108f700000000", "06090104fb00000000", "06090102fd00000000", "06090101fe00000000"]
 
 
-def make_node(sysfs, name, hid_id, descriptor, interface=2):
-    target = sysfs / "devices" / "pci0000:00" / "0000:00:14.0" / "usb3" / "3-2" / f"3-2:1.{interface}" / hid_id.replace("0003:", "")
+def make_node(sysfs, name, hid_id, descriptor, interface=2, usb="3-2"):
+    target = sysfs / "devices" / "pci0000:00" / "0000:00:14.0" / "usb3" / usb / f"{usb}:1.{interface}" / hid_id.replace("0003:", "")
     target.mkdir(parents=True)
     (target / "uevent").write_text(f"DRIVER=hid-generic\nHID_ID={hid_id}\n")
     (target / "report_descriptor").write_bytes(descriptor)
@@ -45,16 +45,22 @@ class FindDevicesTest(unittest.TestCase):
         make_node(self.sysfs, "hidraw1", x3_hid.RECEIVER_HID_ID, FEATURE_COLLECTION)
         make_node(self.sysfs, "hidraw2", x3_hid.CABLE_HID_ID, FEATURE_COLLECTION)
         self.assertEqual(x3_hid.find_devices(self.sysfs),
-                         {"receiver": "/dev/hidraw1", "cable": "/dev/hidraw2"})
+                         {"receiver": ["/dev/hidraw1"], "cable": "/dev/hidraw2"})
+
+    def test_reports_every_receiver_candidate(self):
+        make_node(self.sysfs, "hidraw1", x3_hid.RECEIVER_HID_ID, FEATURE_COLLECTION)
+        make_node(self.sysfs, "hidraw4", x3_hid.RECEIVER_HID_ID, FEATURE_COLLECTION, usb="3-3")
+        self.assertEqual(x3_hid.find_devices(self.sysfs),
+                         {"receiver": ["/dev/hidraw1", "/dev/hidraw4"], "cable": None})
 
     def test_requires_interface_2_and_the_feature_collection(self):
         make_node(self.sysfs, "hidraw1", x3_hid.RECEIVER_HID_ID, FEATURE_COLLECTION, interface=1)
         make_node(self.sysfs, "hidraw2", x3_hid.RECEIVER_HID_ID, MOUSE_COLLECTION)
-        self.assertEqual(x3_hid.find_devices(self.sysfs), {"receiver": None, "cable": None})
+        self.assertEqual(x3_hid.find_devices(self.sysfs), {"receiver": [], "cable": None})
 
     def test_ignores_other_devices_on_the_same_interface(self):
         make_node(self.sysfs, "hidraw3", "0003:0000046D:0000C52B", FEATURE_COLLECTION)
-        self.assertEqual(x3_hid.find_devices(self.sysfs), {"receiver": None, "cable": None})
+        self.assertEqual(x3_hid.find_devices(self.sysfs), {"receiver": [], "cable": None})
 
 
 class DecodeTest(unittest.TestCase):
@@ -152,6 +158,116 @@ class CommandTest(unittest.TestCase):
     def test_ioctl_number_matches_the_x3_report_length(self):
         self.assertEqual(x3_hid.hidiocsfeature(52), 0xC0344806)
         self.assertEqual(x3_hid.hidiocsfeature(13), 0xC00D4806)
+
+
+class ConfirmX3Test(unittest.TestCase):
+    def test_an_x3_report_confirms_its_node_without_writing(self):
+        opened = []
+
+        def open_node(path, flags):
+            opened.append((path, flags))
+            return 7
+
+        with mock.patch.object(x3_hid.os, "read", return_value=bytes.fromhex("0310400104")), \
+             mock.patch.object(x3_hid.os, "close") as close, \
+             mock.patch.object(x3_hid.fcntl, "ioctl") as ioctl:
+            result = x3_hid.confirm_x3(["/dev/hidraw2"], open_node=open_node,
+                                       select_ready=lambda fds, _w, _x, _t: (fds, [], []),
+                                       clock=lambda: 0.0)
+
+        self.assertEqual(result, ("/dev/hidraw2", None))
+        self.assertEqual(opened, [("/dev/hidraw2", x3_hid.os.O_RDONLY | x3_hid.os.O_NONBLOCK)])
+        ioctl.assert_not_called()
+        close.assert_called_once_with(7)
+
+    def test_the_only_candidate_with_another_model_stops_early_as_other_mouse(self):
+        selects = []
+
+        def select_ready(fds, _w, _x, timeout):
+            selects.append(timeout)
+            return fds, [], []
+
+        with mock.patch.object(x3_hid.os, "open", return_value=7), \
+             mock.patch.object(x3_hid.os, "read", return_value=bytes.fromhex("033d400125")), \
+             mock.patch.object(x3_hid.os, "close"), \
+             mock.patch.object(x3_hid.fcntl, "ioctl") as ioctl:
+            result = x3_hid.confirm_x3(["/dev/hidraw2"], select_ready=select_ready, clock=lambda: 0.0)
+
+        self.assertEqual(result, (None, "other-mouse"))
+        self.assertEqual(len(selects), 1)
+        ioctl.assert_not_called()
+
+    def test_with_two_receivers_another_model_does_not_win_and_the_x3_is_chosen(self):
+        fds_by_path = {"/dev/hidraw2": 7, "/dev/hidraw4": 8}
+        reports = {7: bytes.fromhex("033d400125"), 8: bytes.fromhex("0310400104")}
+        opened = []
+        selects = []
+
+        def open_node(path, flags):
+            opened.append(path)
+            return fds_by_path[path]
+
+        def select_ready(fds, _w, _x, _timeout):
+            selects.append(list(fds))
+            return ([7], [], []) if len(selects) == 1 else ([8], [], [])
+
+        with mock.patch.object(x3_hid.os, "read", side_effect=lambda fd, _length: reports[fd]), \
+             mock.patch.object(x3_hid.os, "close"):
+            result = x3_hid.confirm_x3(["/dev/hidraw2", "/dev/hidraw4"], open_node=open_node,
+                                       select_ready=select_ready, clock=lambda: 0.0)
+
+        self.assertEqual(result, ("/dev/hidraw4", None))
+        self.assertEqual(opened, ["/dev/hidraw2", "/dev/hidraw4"])
+        self.assertEqual(len(selects), 2)
+
+    def test_several_candidates_with_only_other_models_wait_for_the_budget(self):
+        times = iter([0.0, 0.0, 1.0, 2.0])
+        selects = []
+
+        def select_ready(fds, _w, _x, _timeout):
+            selects.append(list(fds))
+            return fds, [], []
+
+        with mock.patch.object(x3_hid.os, "open", side_effect=[7, 8]), \
+             mock.patch.object(x3_hid.os, "read", return_value=bytes.fromhex("033d400125")), \
+             mock.patch.object(x3_hid.os, "close"):
+            result = x3_hid.confirm_x3(["/dev/hidraw2", "/dev/hidraw4"], budget=2.0,
+                                       select_ready=select_ready, clock=lambda: next(times))
+
+        self.assertEqual(result, (None, "other-mouse"))
+        self.assertEqual(len(selects), 2)
+
+    def test_a_candidate_unplugged_during_the_check_drops_out(self):
+        selects = []
+
+        def select_ready(fds, _w, _x, _timeout):
+            selects.append(list(fds))
+            return ([7], [], []) if len(selects) == 1 else ([8], [], [])
+
+        def read(fd, _length):
+            if fd == 7:
+                raise OSError(x3_hid.errno.EIO, "unplugged")
+            return bytes.fromhex("0310400104")
+
+        with mock.patch.object(x3_hid.os, "open", side_effect=[7, 8]), \
+             mock.patch.object(x3_hid.os, "read", side_effect=read), \
+             mock.patch.object(x3_hid.os, "close"):
+            result = x3_hid.confirm_x3(["/dev/hidraw2", "/dev/hidraw4"],
+                                       select_ready=select_ready, clock=lambda: 0.0)
+
+        self.assertEqual(result, ("/dev/hidraw4", None))
+        self.assertEqual(selects, [[7, 8], [8]])
+
+    def test_no_report_before_the_budget_is_a_timeout(self):
+        times = iter([0.0, 19.9, 20.0])
+        with mock.patch.object(x3_hid.os, "open", return_value=7), \
+             mock.patch.object(x3_hid.os, "close") as close:
+            result = x3_hid.confirm_x3(["/dev/hidraw2"], budget=20.0,
+                                       select_ready=lambda _fds, _w, _x, _t: ([], [], []),
+                                       clock=lambda: next(times))
+
+        self.assertEqual(result, (None, "timeout"))
+        close.assert_called_once_with(7)
 
 
 class TransportTest(unittest.TestCase):
@@ -286,10 +402,14 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(sleeps, [0.5])
 
     def test_watch_nodes_open_for_feature_writes(self):
-        with mock.patch.object(x3_hid.os, "open", return_value=7) as open_node:
-            fds = x3_hid._open_inputs({"receiver": "/dev/hidraw2", "cable": None})
-        self.assertEqual(fds, {7: "/dev/hidraw2"})
-        open_node.assert_called_once_with("/dev/hidraw2", x3_hid.os.O_RDWR | x3_hid.os.O_NONBLOCK)
+        with mock.patch.object(x3_hid.os, "open", side_effect=[7, 8, 9]) as open_node:
+            fds = x3_hid._open_inputs({"receiver": ["/dev/hidraw2", "/dev/hidraw4"], "cable": "/dev/hidraw9"})
+        self.assertEqual(fds, {7: "/dev/hidraw2", 8: "/dev/hidraw4", 9: "/dev/hidraw9"})
+        self.assertEqual(open_node.call_args_list, [
+            mock.call("/dev/hidraw2", x3_hid.os.O_RDWR | x3_hid.os.O_NONBLOCK),
+            mock.call("/dev/hidraw4", x3_hid.os.O_RDWR | x3_hid.os.O_NONBLOCK),
+            mock.call("/dev/hidraw9", x3_hid.os.O_RDWR | x3_hid.os.O_NONBLOCK),
+        ])
 
     def test_polling_packet_matches_model_js_report6_for_every_rate(self):
         # tests/tst_model.qml pins Model.report6 to the same hex.
@@ -312,33 +432,149 @@ class TransportTest(unittest.TestCase):
             x3_hid.prime_receiver({7: "/dev/hidraw2"}, "/dev/hidraw2")
         self.assertEqual(ioctls, [(x3_hid.hidiocsfeature(9), x3_hid.polling_packet(1))])
 
-    def test_watch_primes_the_receiver_when_it_opens(self):
+    def test_watch_does_not_prime_a_receiver_before_an_x3_report(self):
         fds = {7: "/dev/hidraw2"}
-        with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": "/dev/hidraw2", "cable": None}), \
+        with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": ["/dev/hidraw2"], "cable": None}), \
              mock.patch.object(x3_hid, "_open_inputs", return_value=fds), \
              mock.patch.object(x3_hid, "prime_receiver") as prime, \
              mock.patch.object(x3_hid.select, "select", side_effect=KeyboardInterrupt), \
              mock.patch.object(x3_hid.os, "close"):
             with self.assertRaises(KeyboardInterrupt):
                 x3_hid.watch()
-        prime.assert_called_once_with(fds, "/dev/hidraw2", x3_hid.PROFILE_PATH)
+        prime.assert_not_called()
+
+    def test_watch_primes_the_receiver_that_reports_the_x3_model(self):
+        fds = {7: "/dev/hidraw2", 8: "/dev/hidraw4"}
+        selects = []
+
+        def select_then_stop(fds_ready, _w, _x, _timeout):
+            selects.append(list(fds_ready))
+            if len(selects) == 1:
+                return [8], [], []
+            raise KeyboardInterrupt
+
+        with mock.patch.object(x3_hid, "find_devices",
+                               return_value={"receiver": ["/dev/hidraw2", "/dev/hidraw4"], "cable": None}), \
+             mock.patch.object(x3_hid, "_open_inputs", return_value=fds), \
+             mock.patch.object(x3_hid, "prime_receiver") as prime, \
+             mock.patch.object(x3_hid, "emit"), \
+             mock.patch.object(x3_hid.select, "select", side_effect=select_then_stop), \
+             mock.patch.object(x3_hid.os, "read", return_value=bytes.fromhex("0310400104")), \
+             mock.patch.object(x3_hid.os, "close"):
+            with self.assertRaises(KeyboardInterrupt):
+                x3_hid.watch()
+        prime.assert_called_once_with(fds, "/dev/hidraw4", x3_hid.PROFILE_PATH)
+
+    def test_watch_does_not_prime_a_receiver_that_reports_another_model(self):
+        fds = {7: "/dev/hidraw2"}
+        selects = []
+
+        def select_then_stop(fds_ready, _w, _x, _timeout):
+            selects.append(list(fds_ready))
+            if len(selects) == 1:
+                return [7], [], []
+            raise KeyboardInterrupt
+
+        with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": ["/dev/hidraw2"], "cable": None}), \
+             mock.patch.object(x3_hid, "_open_inputs", return_value=fds), \
+             mock.patch.object(x3_hid, "prime_receiver") as prime, \
+             mock.patch.object(x3_hid, "emit"), \
+             mock.patch.object(x3_hid.select, "select", side_effect=select_then_stop), \
+             mock.patch.object(x3_hid.os, "read", return_value=bytes.fromhex("033d400125")), \
+             mock.patch.object(x3_hid.os, "close"):
+            with self.assertRaises(KeyboardInterrupt):
+                x3_hid.watch()
+        prime.assert_not_called()
+
+    def watch_report_then_silence(self, report):
+        fds = {7: "/dev/hidraw2", 8: "/dev/hidraw4"}
+        times = iter([0.0, 0.0, 1.0, 6.5])
+        selects = []
+
+        def select_then_stop(fds_ready, _w, _x, _timeout):
+            selects.append(list(fds_ready))
+            if len(selects) == 1:
+                return [8], [], []
+            if len(selects) == 2:
+                return [], [], []
+            raise KeyboardInterrupt
+
+        with mock.patch.object(x3_hid, "find_devices",
+                               return_value={"receiver": ["/dev/hidraw2", "/dev/hidraw4"], "cable": None}), \
+             mock.patch.object(x3_hid, "_open_inputs", return_value=fds), \
+             mock.patch.object(x3_hid, "prime_receiver"), \
+             mock.patch.object(x3_hid, "emit") as emit, \
+             mock.patch.object(x3_hid.select, "select", side_effect=select_then_stop), \
+             mock.patch.object(x3_hid.os, "read", return_value=bytes.fromhex(report)), \
+             mock.patch.object(x3_hid.os, "close"), \
+             mock.patch.object(x3_hid.time, "monotonic", side_effect=lambda: next(times)):
+            with self.assertRaises(KeyboardInterrupt):
+                x3_hid.watch()
+        return [call.args[0] for call in emit.call_args_list]
+
+    def test_watch_ignores_another_model_when_timing_the_x3_silence(self):
+        messages = self.watch_report_then_silence("033d400125")
+        self.assertIn({"ok": False, "error": "asleep"}, messages)
+
+    def test_watch_x3_reports_refresh_the_silence_timer(self):
+        messages = self.watch_report_then_silence("0310400104")
+        self.assertNotIn({"ok": False, "error": "asleep"}, messages)
 
     def test_apply_prefers_the_cable_node_and_saves_only_after_success(self):
         packet = "06090101fe00000000"
         sent = []
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "profile.json"
-            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": "/dev/hidraw2", "cable": "/dev/hidraw9"}), \
+            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": ["/dev/hidraw2"], "cable": "/dev/hidraw9"}), \
+                 mock.patch.object(x3_hid, "confirm_x3") as confirm, \
                  mock.patch.object(x3_hid, "send_packets", side_effect=lambda device, packets, transport: sent.append((device, packets, transport)) or None):
                 self.assertEqual(x3_hid.apply(['{"polling": 3}', packet], path), {"ok": True})
+            confirm.assert_not_called()
             self.assertEqual(sent[0][0], "/dev/hidraw9")
             self.assertEqual(sent[0][2], "cable")
             self.assertEqual(json.loads(path.read_text()), {"polling": 3})
 
             path.unlink()
-            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": "/dev/hidraw2", "cable": None}), \
+            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": ["/dev/hidraw2"], "cable": None}), \
+                 mock.patch.object(x3_hid, "confirm_x3", return_value=("/dev/hidraw2", None)), \
                  mock.patch.object(x3_hid, "send_packets", return_value="timeout"):
                 self.assertEqual(x3_hid.apply(['{"polling": 3}', packet], path), {"ok": False, "error": "timeout"})
+            self.assertFalse(path.exists())
+
+    def test_apply_writes_nothing_when_the_only_receiver_is_another_mouse(self):
+        packet = "06090101fe00000000"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.json"
+            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": ["/dev/hidraw2"], "cable": None}), \
+                 mock.patch.object(x3_hid, "confirm_x3", return_value=(None, "other-mouse")), \
+                 mock.patch.object(x3_hid, "send_packets") as send:
+                self.assertEqual(x3_hid.apply(['{"polling": 3}', packet], path), {"ok": False, "error": "other-mouse"})
+            send.assert_not_called()
+            self.assertFalse(path.exists())
+
+    def test_apply_confirms_every_candidate_and_sends_only_to_the_x3_node(self):
+        packet = "06090101fe00000000"
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.json"
+            with mock.patch.object(x3_hid, "find_devices",
+                                   return_value={"receiver": ["/dev/hidraw2", "/dev/hidraw4"], "cable": None}), \
+                 mock.patch.object(x3_hid, "confirm_x3", return_value=("/dev/hidraw4", None)) as confirm, \
+                 mock.patch.object(x3_hid, "send_packets", side_effect=lambda device, packets, transport: sent.append((device, packets, transport)) or None):
+                self.assertEqual(x3_hid.apply(['{"polling": 3}', packet], path), {"ok": True})
+            confirm.assert_called_once_with(["/dev/hidraw2", "/dev/hidraw4"])
+            self.assertEqual(sent[0][0], "/dev/hidraw4")
+            self.assertEqual(sent[0][2], "receiver")
+
+    def test_apply_writes_nothing_when_no_x3_report_arrives(self):
+        packet = "06090101fe00000000"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.json"
+            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": ["/dev/hidraw2"], "cable": None}), \
+                 mock.patch.object(x3_hid, "confirm_x3", return_value=(None, "timeout")), \
+                 mock.patch.object(x3_hid, "send_packets") as send:
+                self.assertEqual(x3_hid.apply(['{"polling": 3}', packet], path), {"ok": False, "error": "timeout"})
+            send.assert_not_called()
             self.assertFalse(path.exists())
 
     def test_a_dpi_event_saved_while_apply_waits_survives_the_successful_apply(self):
@@ -354,7 +590,8 @@ class TransportTest(unittest.TestCase):
                 x3_hid.save_profile(current, path)
                 return None
 
-            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": "/dev/hidraw2", "cable": None}), \
+            with mock.patch.object(x3_hid, "find_devices", return_value={"receiver": ["/dev/hidraw2"], "cable": None}), \
+                 mock.patch.object(x3_hid, "confirm_x3", return_value=("/dev/hidraw2", None)), \
                  mock.patch.object(x3_hid, "send_packets", side_effect=dpi_button_during_ack_wait):
                 self.assertEqual(x3_hid.apply([json.dumps(job), packet], path), {"ok": True})
             self.assertEqual(json.loads(path.read_text()), current)

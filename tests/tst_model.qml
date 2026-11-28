@@ -276,6 +276,7 @@ TestCase {
   function test_apply_errors_tell_what_to_do() {
     compare(Model.applyError('{"ok": true}'), "")
     compare(Model.applyError('{"ok": false, "error": "timeout"}'), "The mouse is asleep. Move it and try again.")
+    compare(Model.applyError('{"ok": false, "error": "other-mouse"}'), "Another mouse's receiver is plugged in. Plug in the X3 receiver.")
     verify(Model.applyError("").length > 0)
     verify(Model.applyError('{"ok": false, "error": "weird"}').length > 0)
   }
