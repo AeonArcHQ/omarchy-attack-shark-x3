@@ -43,7 +43,9 @@ cable (`1d57:fa61`), without the Windows driver.
 Over the receiver, the plugin receives the battery heartbeat, DPI-stage and
 polling-rate events, and waits for the mouse to acknowledge every setting it
 sends; a setting that gets no ACK after the retries fails with "the mouse
-is asleep". Over the cable, the X3 firmware does not send those
+is asleep". The receiver id is shared with other mice, so the helper first
+listens for the X3 model byte and writes only to a receiver that reported
+it. Over the cable, the X3 firmware does not send those
 acknowledgements, so the plugin sends each setting and waits the same
 500 ms X3.exe waits.
 
@@ -83,13 +85,15 @@ Optionally delete the saved profile:
 
 ## How it works
 
-- `x3-hid`: Python helper, standard library only. It finds the receiver and
-  cable interface `hidraw` nodes through sysfs and listens to input report
-  3: power, DPI stage and polling. When the receiver opens, it sends the
-  saved polling report once; that first report makes the receiver deliver
-  DPI-stage events. `apply` sends feature reports. Over the receiver it
-  retries each report, the polling report included, until its ACK arrives,
-  and fails when none comes; over the cable it waits 500 ms. It saves the profile only after every report succeeds.
+- `x3-hid`: Python helper, standard library only. It finds every receiver
+  candidate and the cable interface `hidraw` nodes through sysfs and listens
+  to input report 3: power, DPI stage and polling. When a receiver reports
+  the X3 model, it sends the saved polling report once to that receiver;
+  that first report makes the receiver deliver DPI-stage events. `apply`
+  confirms the receiver the same way before sending feature reports. Over
+  the receiver it retries each report, the polling report included, until
+  its ACK arrives, and fails when none comes; over the cable it waits
+  500 ms. It saves the profile only after every report succeeds.
 - `Model.js`: builds reports 0x04 (DPI and sensor), 0x05 (factory light
   bytes and timing), 0x06 (polling) and 0x08 (buttons), and decides what the
   bar and the panel show.
