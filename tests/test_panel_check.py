@@ -129,7 +129,7 @@ class EdgeScanTest(unittest.TestCase):
         self.assertEqual(len(controls), 1)
         self.assertTrue(controls[0]["cut"])
         self.assertEqual(panel_check.missing_edges(rows), [])
-        result = {"frame": {"x": 0, "y": 0, "width": width, "height": 30}, "rows": rows}
+        result = {"frame": {"x": 0, "y": 0, "width": width, "height": 30, "thickness": 1}, "rows": rows}
         self.assertIn("cut", panel_check.format_report("x3", result).splitlines()[-1])
 
     def test_a_cut_control_still_reports_a_missing_side_edge(self):
@@ -157,21 +157,47 @@ class EdgeScanTest(unittest.TestCase):
             put(buf, width, x, 10)
         self.assertEqual(panel_check.analyze_controls(bytes(buf), width, height), [])
 
-    def test_frame_from_difference_finds_the_changed_rectangle(self):
-        width, height = 160, 100
+    def test_a_uniform_frame_line_on_a_black_panel_is_the_frame(self):
+        width, height = 400, 300
+        black = (0, 0, 0)
+        frame_color = (141, 141, 141)
+        before = canvas(width, height, black)
+        after = canvas(width, height, black)
+        # Text behind and inside the panel changes too; it must not matter.
+        for x in range(10, 60, 3):
+            put(before, width, x, 150, (200, 200, 200))
+            put(after, width, x + 1, 150, (200, 200, 200))
+        left, top, right, bottom = 60, 20, 330, 270
+        for t in range(3):
+            for x in range(left, right + 1):
+                put(after, width, x, top + t, frame_color)
+                put(after, width, x, bottom - t, frame_color)
+            for y in range(top, bottom + 1):
+                put(after, width, left + t, y, frame_color)
+                put(after, width, right - t, y, frame_color)
+        frame = panel_check.frame_from_lines(bytes(before), bytes(after), width, height)
+        self.assertEqual(frame, {"x": left, "y": top, "width": right - left + 1,
+                                 "height": bottom - top + 1, "thickness": 3})
+
+    def test_text_like_changes_have_no_frame(self):
+        width, height = 400, 300
+        before = canvas(width, height, (0, 0, 0))
+        after = canvas(width, height, (0, 0, 0))
+        for y in range(20, 280, 12):
+            for x in range(20, 380):
+                if (x // 4 + y) % 3:
+                    put(after, width, x, y, (180, 180, 180))
+                    put(after, width, x, y + 1, (180, 180, 180))
+        self.assertIsNone(panel_check.frame_from_lines(bytes(before), bytes(after), width, height))
+
+    def test_a_filled_changed_rectangle_without_a_frame_line_is_not_a_frame(self):
+        width, height = 400, 300
         before = canvas(width, height)
         after = canvas(width, height)
-        for y in range(20, 70):
-            for x in range(30, 120):
-                i = (y * width + x) * 3
-                after[i:i + 3] = bytes((35, 35, 40))
-        frame = panel_check.frame_from_difference(bytes(before), bytes(after), width, height)
-        self.assertIsNotNone(frame)
-        self.assertLessEqual(abs(frame["x"] - 30), 1)
-        self.assertLessEqual(abs(frame["y"] - 20), 1)
-        self.assertLessEqual(abs(frame["width"] - 90), 2)
-        self.assertLessEqual(abs(frame["height"] - 50), 2)
-
+        for y in range(20, 270):
+            for x in range(30, 330):
+                put(after, width, x, y, (35, 35, 40))
+        self.assertIsNone(panel_check.frame_from_lines(bytes(before), bytes(after), width, height))
 
 if __name__ == "__main__":
     unittest.main()

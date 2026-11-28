@@ -22,9 +22,14 @@ MIN_RUN = 30
 # A channel change at least this large marks a pixel as changed between the
 # closed and open captures.
 DIFF_THRESHOLD = 12
-# The panel's scroll clip can cut the last control: its side edges then reach
-# the bottom of the analyzed region, within this many pixels, with no bottom.
-CUT_TOLERANCE = 4
+# The panel frame is a line of one colour: horizontal and vertical sides at
+# least this long, and between 2 and FRAME_MAX_THICKNESS pixels thick.
+FRAME_MIN_LENGTH = 200
+FRAME_MAX_THICKNESS = 8
+# The panel's scroll clip can cut the last control: its side edges then end,
+# with no bottom edge, within this many pixels of the frame's inside. The
+# margin covers the panel's bottom padding (16 px on the X3 panel).
+CUT_TOLERANCE = 20
 
 
 def grey(p):
@@ -253,73 +258,78 @@ def _changed(before, after, i):
     return any(abs(after[i + c] - before[i + c]) >= DIFF_THRESHOLD for c in range(3))
 
 
-def frame_from_difference(before, after, width, height):
-    """Bounding box of the largest changed rectangular region.
+def _color_at(data, width, x, y):
+    i = _offset(width, x, y)
+    return bytes(data[i:i + 3])
 
-    The panel is the only large object appearing between the closed and open
-    captures, so row and column projections are enough and avoid depending on
-    a theme color.
+
+def frame_line_runs(before, after, width, height, min_length=FRAME_MIN_LENGTH):
+    """Horizontal runs of one exact colour that are new in `after`.
+
+    Yields (y, x0, x1, colour) for each inclusive run at least min_length long
+    whose every pixel changed from `before`.
+    """
+    stride = width * 3
+    for y in range(height):
+        if after[y * stride:(y + 1) * stride] == before[y * stride:(y + 1) * stride]:
+            continue
+        x = 0
+        while x < width:
+            i = _offset(width, x, y)
+            if not _changed(before, after, i):
+                x += 1
+                continue
+            color = bytes(after[i:i + 3])
+            end = x
+            while end + 1 < width:
+                j = i + (end + 1 - x) * 3
+                if after[j:j + 3] != color or not _changed(before, after, j):
+                    break
+                end += 1
+            if end - x + 1 >= min_length:
+                yield y, x, end, color
+            x = end + 1
+
+
+def _vertical_length(data, width, height, x, y, color, limit=None):
+    """Consecutive rows from y down whose pixel at column x is `color`."""
+    last = height if limit is None else min(height, y + limit)
+    length = 0
+    for yy in range(y, last):
+        if _color_at(data, width, x, yy) != color:
+            break
+        length += 1
+    return length
+
+
+def frame_from_lines(before, after, width, height):
+    """The panel frame: the largest rectangle drawn by a new uniform line.
+
+    The panel background can be the same colour as whatever is behind it, so
+    the frame line itself is what appears between the closed and open
+    captures. Its colour is read from the line, never assumed. The top side
+    is a run at least FRAME_MIN_LENGTH long and 2..FRAME_MAX_THICKNESS pixels
+    thick, closed at both ends by vertical lines of the same colour at least
+    FRAME_MIN_LENGTH long; they end on the bottom side.
     """
     if len(before) != len(after) or len(before) != width * height * 3:
         raise ValueError("RGB buffers must have equal width*height*3 bytes")
-    row_counts = [0] * height
-    for y in range(height):
-        base = y * width * 3
-        count = 0
-        for i in range(base, base + width * 3, 3):
-            if _changed(before, after, i):
-                count += 1
-        row_counts[y] = count
-
-    def segments(counts):
-        peak = max(counts, default=0)
-        if peak < 20:
-            return []
-        threshold = max(20, peak // 5)
-        out = []
-        start = None
-        end = None
-        total = 0
-        gaps = 0
-        for index, count in enumerate(counts + [0, 0, 0]):
-            if count >= threshold:
-                if start is None:
-                    start = index
-                    total = 0
-                end = index
-                total += count
-                gaps = 0
-            elif start is not None:
-                gaps += 1
-                if gaps > 2:
-                    out.append((start, end, total))
-                    start = None
-                    gaps = 0
-        return out
-
-    row_segments = segments(row_counts)
-    if not row_segments:
-        return None
-    y0, y1, _total = max(row_segments, key=lambda item: item[2])
-
-    column_counts = [0] * width
-    for x in range(width):
-        count = 0
-        for y in range(y0, y1 + 1):
-            if _changed(before, after, _offset(width, x, y)):
-                count += 1
-        column_counts[x] = count
-    column_segments = segments(column_counts)
-    if not column_segments:
-        return None
-    x0, x1, _total = max(column_segments, key=lambda item: item[2])
-
-    # Anti-aliased frame pixels often fall just below the diff threshold.
-    x0 = max(0, x0 - 1)
-    y0 = max(0, y0 - 1)
-    x1 = min(width - 1, x1 + 1)
-    y1 = min(height - 1, y1 + 1)
-    return {"x": x0, "y": y0, "width": x1 - x0 + 1, "height": y1 - y0 + 1}
+    best = None
+    for y, x0, x1, color in frame_line_runs(before, after, width, height):
+        middle = (x0 + x1) // 2
+        if y > 0 and _color_at(after, width, middle, y - 1) == color:
+            continue  # not the top row of the line
+        thickness = _vertical_length(after, width, height, middle, y, color, FRAME_MAX_THICKNESS + 1)
+        if not 2 <= thickness <= FRAME_MAX_THICKNESS:
+            continue
+        sides = min(_vertical_length(after, width, height, x0, y, color),
+                    _vertical_length(after, width, height, x1, y, color))
+        if sides < FRAME_MIN_LENGTH:
+            continue
+        frame = {"x": x0, "y": y, "width": x1 - x0 + 1, "height": sides, "thickness": thickness}
+        if best is None or frame["width"] * frame["height"] > best["width"] * best["height"]:
+            best = frame
+    return best
 
 
 def png_size(path):
@@ -350,10 +360,10 @@ def analyze_capture(before_path, after_path):
     after, after_width, after_height = read_rgb(after_path)
     if (after_width, after_height) != (width, height):
         raise RuntimeError("the before/after captures have different dimensions")
-    frame = frame_from_difference(before, after, width, height)
+    frame = frame_from_lines(before, after, width, height)
     if frame is None:
         return {"frame": None, "rows": []}
-    inset = 4
+    inset = frame["thickness"]
     region = (frame["x"] + inset, frame["y"] + inset,
               frame["x"] + frame["width"] - inset, frame["y"] + frame["height"] - inset)
     rows = analyze_controls(after, width, height, region)
@@ -367,10 +377,10 @@ def format_report(target, result):
         lines.append("frame: not found")
         return "\n".join(lines)
     lines.append(
-        "frame: x={x} y={y} width={width} height={height}".format(**frame))
+        "frame: x={x} y={y} width={width} height={height} thickness={thickness}".format(**frame))
     lefts = [control["x"] for row in result["rows"] for control in row]
     margin = min(lefts) - frame["x"] if lefts else None
-    lines.append("content left margin: " + (f"{margin}px" if margin is not None else "n/a"))
+    lines.append("content left margin: " + (f"{margin}px" if margin is not None else "no buttons"))
     lines.append("row  button  x     y     width  height  left  right  top  bottom")
     for row_index, row in enumerate(result["rows"], 1):
         lines.append(f"row {row_index}: {len(row)} button(s)")
@@ -452,6 +462,9 @@ def main(argv=None):
                 missing = missing_edges(result["rows"])
                 if result["frame"] is None:
                     print("x3 missing edges: panel frame not found", file=sys.stderr)
+                    exit_code = 1
+                elif not result["rows"]:
+                    print("x3 missing edges: no buttons found", file=sys.stderr)
                     exit_code = 1
                 elif missing:
                     print("x3 missing edges: " + ", ".join(
